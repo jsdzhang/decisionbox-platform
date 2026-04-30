@@ -10,11 +10,11 @@ import (
 	"testing"
 
 	gollm "github.com/decisionbox-io/decisionbox/libs/go-common/llm"
-	"github.com/decisionbox-io/decisionbox/libs/go-common/llm/modelcatalog"
 	"github.com/decisionbox-io/decisionbox/services/api/models"
 
 	// Register real providers so GetProviderMeta finds them.
 	_ "github.com/decisionbox-io/decisionbox/providers/llm/claude"
+	_ "github.com/decisionbox-io/decisionbox/providers/llm/ollama"
 	_ "github.com/decisionbox-io/decisionbox/providers/llm/openai"
 )
 
@@ -259,7 +259,7 @@ func TestProvidersHandler_Merge_CatalogOnlyRowsKeptWithNoLive(t *testing.T) {
 			t.Errorf("unexpected source %q for %s when live failed", m.Source, m.ID)
 		}
 		// Every OpenAI catalog row is wire=openai-compat → dispatchable
-		if m.Wire == string(modelcatalog.OpenAICompat) && !m.Dispatchable {
+		if m.Wire == string(gollm.WireOpenAICompat) && !m.Dispatchable {
 			t.Errorf("row %s has wire=openai-compat but dispatchable=false", m.ID)
 		}
 		if m.Dispatchable {
@@ -268,6 +268,51 @@ func TestProvidersHandler_Merge_CatalogOnlyRowsKeptWithNoLive(t *testing.T) {
 	}
 	if !foundDispatchable {
 		t.Error("expected at least one dispatchable catalog row for openai")
+	}
+}
+
+// TestProvidersHandler_Merge_OllamaCatalogRowsDispatchable is the
+// regression test for the issue Copilot flagged on PR #193: Ollama
+// catalog entries leave Wire blank because the provider has no
+// dispatch switch (single-wire), but the live-list merge previously
+// derived Dispatchable from `Wire != ""` — making every Ollama
+// catalog row appear non-dispatchable in the dashboard. Catalog rows
+// are dispatchable by construction.
+func TestProvidersHandler_Merge_OllamaCatalogRowsDispatchable(t *testing.T) {
+	h := NewProvidersHandler()
+	req := httptest.NewRequest("POST", "/api/v1/providers/llm/ollama/models/live",
+		strings.NewReader(`{"config":{"host":"http://127.0.0.1:1"}}`))
+	req.SetPathValue("id", "ollama")
+	w := httptest.NewRecorder()
+
+	h.ListLiveLLMModels(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	var resp struct {
+		Data struct {
+			Models []struct {
+				ID           string `json:"id"`
+				Source       string `json:"source"`
+				Wire         string `json:"wire"`
+				Dispatchable bool   `json:"dispatchable"`
+			} `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data.Models) == 0 {
+		t.Fatal("ollama catalog should expose at least one row")
+	}
+	for _, m := range resp.Data.Models {
+		if m.Source != "catalog" {
+			continue
+		}
+		if !m.Dispatchable {
+			t.Errorf("ollama catalog row %q must be dispatchable", m.ID)
+		}
 	}
 }
 
