@@ -222,6 +222,8 @@ func TestSQLFixPrompt(t *testing.T) {
 	}
 	for _, required := range []string{
 		"{{DATASET}}", "{{ORIGINAL_SQL}}", "{{ERROR_MESSAGE}}", "{{SCHEMA_INFO}}",
+		"{{FILTER}}", "{{CONVERSATION_HISTORY}}",
+		"{{#VERIFICATION_CONTEXT}}", "{{VERIFICATION_CONTEXT}}", "{{/VERIFICATION_CONTEXT}}",
 		"QUALIFY", "FLATTEN", "LATERAL", "VARIANT", "ILIKE",
 		"TRY_CAST", "CURRENT_DATABASE", "UPPERCASE",
 	} {
