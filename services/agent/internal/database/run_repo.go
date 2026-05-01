@@ -12,9 +12,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const CollectionDiscoveryRuns = "discovery_runs"
-
-// RunRepository manages DiscoveryRun status documents.
+// RunRepository manages DiscoveryRun status documents. Collection name
+// lives in mongodb.go (sourced from libs/go-common/mongodb).
 type RunRepository struct {
 	col *mongo.Collection
 }
@@ -23,12 +22,13 @@ func NewRunRepository(db *DB) *RunRepository {
 	return &RunRepository{col: db.Collection(CollectionDiscoveryRuns)}
 }
 
-// Create creates a new discovery run and returns its ID.
+// Create creates a new discovery run and returns its ID. Per-step rows
+// are now persisted in the discovery_run_steps collection via
+// RunStepRepository — no embedded `steps` slice initialisation here.
 func (r *RunRepository) Create(ctx context.Context, run *models.DiscoveryRun) (string, error) {
 	run.StartedAt = time.Now()
 	run.UpdatedAt = time.Now()
 	run.Status = models.RunStatusPending
-	run.Steps = make([]models.RunStep, 0)
 
 	result, err := r.col.InsertOne(ctx, run)
 	if err != nil {
@@ -148,23 +148,9 @@ func (r *RunRepository) IncrementAnalysisCounter(ctx context.Context, runID, met
 	return err
 }
 
-// AddStep appends a step to the run's step log.
-func (r *RunRepository) AddStep(ctx context.Context, runID string, step models.RunStep) error {
-	oid, err := primitive.ObjectIDFromHex(runID)
-	if err != nil {
-		return fmt.Errorf("invalid run ID: %w", err)
-	}
-
-	step.Timestamp = time.Now()
-
-	update := bson.M{
-		"$push": bson.M{"steps": step},
-		"$set":  bson.M{"updated_at": time.Now()},
-	}
-
-	_, err = r.col.UpdateByID(ctx, oid, update)
-	return err
-}
+// AddStep was removed — per-step rows now go to the discovery_run_steps
+// collection via RunStepRepository. The previous $push into the embedded
+// steps array hit the 16MB BSON limit on long runs.
 
 // Complete marks a run as completed with stats.
 func (r *RunRepository) Complete(ctx context.Context, runID string, insightsFound int) error {

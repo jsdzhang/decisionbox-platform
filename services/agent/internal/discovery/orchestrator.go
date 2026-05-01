@@ -24,6 +24,17 @@ import (
 	"github.com/decisionbox-io/decisionbox/services/agent/internal/validation"
 )
 
+// discoveryLogPersister is the slice of *database.DiscoveryLogRepository
+// the orchestrator actually calls during a run. Defined as an interface so
+// the persistence wiring (Save{Exploration,Analysis,Validation,Recommendation}*)
+// can be exercised by a unit-level mock instead of requiring MongoDB.
+type discoveryLogPersister interface {
+	SaveExplorationSteps(ctx context.Context, projectID, discoveryID, runID string, steps []models.ExplorationStep) error
+	SaveAnalysisSteps(ctx context.Context, projectID, discoveryID, runID string, steps []models.AnalysisStep) error
+	SaveValidationResults(ctx context.Context, projectID, discoveryID, runID string, results []models.ValidationResult) error
+	SaveRecommendationLog(ctx context.Context, projectID, discoveryID, runID string, step *models.RecommendationStep) error
+}
+
 // AnalysisArea defines an analysis area resolved from project prompts.
 type AnalysisArea struct {
 	ID          string
@@ -47,10 +58,15 @@ type Orchestrator struct {
 	aiClient      *ai.Client
 	warehouse     gowarehouse.Provider
 
-	contextRepo   *database.ContextRepository
-	discoveryRepo *database.DiscoveryRepository
-	feedbackRepo  *database.FeedbackRepository
-	debugLogRepo  *database.DebugLogRepository
+	contextRepo      *database.ContextRepository
+	discoveryRepo    *database.DiscoveryRepository
+	// discoveryLogRepo is held as an interface so unit tests can inject
+	// a mock without having to spin up MongoDB. The concrete writer is
+	// *database.DiscoveryLogRepository, wired in production by
+	// agentserver.go.
+	discoveryLogRepo discoveryLogPersister
+	feedbackRepo     *database.FeedbackRepository
+	debugLogRepo     *database.DebugLogRepository
 
 	explorationEngine    *ai.ExplorationEngine
 	userCountValidator   *validation.UserCountValidator
@@ -105,13 +121,26 @@ type OrchestratorOptions struct {
 	AIClient      *ai.Client
 	Warehouse     gowarehouse.Provider
 
-	ContextRepo   *database.ContextRepository
-	DiscoveryRepo *database.DiscoveryRepository
-	FeedbackRepo  *database.FeedbackRepository
-	DebugLogRepo  *database.DebugLogRepository
+	ContextRepo      *database.ContextRepository
+	DiscoveryRepo    *database.DiscoveryRepository
+	// DiscoveryLogRepo persists the per-step / per-area / per-result rows
+	// (exploration_steps, analysis_steps, validation_results,
+	// recommendation_log) that used to be embedded arrays inside the
+	// discoveries document. Optional — when nil the orchestrator skips
+	// the per-step persistence and only the parent DiscoveryResult lands
+	// in Mongo. Production builds always wire this; the nil branch exists
+	// for unit tests that don't bring up MongoDB.
+	DiscoveryLogRepo *database.DiscoveryLogRepository
+	FeedbackRepo     *database.FeedbackRepository
+	DebugLogRepo     *database.DebugLogRepository
 
-	RunRepo         *database.RunRepository
-	RunID           string
+	RunRepo      *database.RunRepository
+	// RunStepRepo persists the per-step rows that used to live as an
+	// embedded `steps` array on the discovery_runs document. Required —
+	// without it the status reporter has nowhere to write the live step
+	// stream and the dashboard's progress feed goes dark.
+	RunStepRepo  *database.RunStepRepository
+	RunID        string
 
 	ProjectID         string
 	Domain            string
@@ -203,14 +232,30 @@ func NewOrchestrator(opts OrchestratorOptions) *Orchestrator {
 
 	// InsightValidator created in RunDiscovery where QueryExecutor is available
 
-	// Status reporter for live updates
-	statusReporter := NewStatusReporter(opts.RunRepo, opts.RunID, 0)
+	// Status reporter for live updates. Per-step rows go to the
+	// discovery_run_steps collection via RunStepRepo (split out of the
+	// run doc to avoid the 16MB-array problem); run-doc-level updates
+	// (status / phase / counters) stay on RunRepo.
+	statusReporter := NewStatusReporter(opts.RunRepo, opts.RunStepRepo, opts.ProjectID, opts.RunID, 0)
+
+	// Normalize a typed-nil concrete pointer back to an untyped-nil
+	// interface so the `o.discoveryLogRepo == nil` guard in
+	// persistSplitLogs is not fooled by Go's interface-conversion
+	// semantics: passing a nil *DiscoveryLogRepository through a
+	// concrete-pointer field would otherwise produce a non-nil
+	// interface value with a nil concrete pointer, and the persistence
+	// branch would dereference it.
+	var discoveryLogRepo discoveryLogPersister
+	if opts.DiscoveryLogRepo != nil {
+		discoveryLogRepo = opts.DiscoveryLogRepo
+	}
 
 	return &Orchestrator{
 		aiClient:           opts.AIClient,
 		warehouse:          opts.Warehouse,
 		contextRepo:        opts.ContextRepo,
 		discoveryRepo:      opts.DiscoveryRepo,
+		discoveryLogRepo:   discoveryLogRepo,
 		feedbackRepo:       opts.FeedbackRepo,
 		debugLogRepo:       opts.DebugLogRepo,
 		debugLogger:        debugLogger,
@@ -781,17 +826,15 @@ func (o *Orchestrator) RunDiscovery(ctx context.Context, opts DiscoveryOptions) 
 			QueriesExecuted:      explorationResult.TotalSteps,
 			Errors:               analysisErrors,
 		},
-		ExplorationLog:    explorationResult.Steps,
-		AnalysisLog:       analysisLog,
-		RecommendationLog: recStep,
-		ValidationLog:     allValidation,
-		CreatedAt:         time.Now(),
-		UpdatedAt:         time.Now(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 
 	if err := o.discoveryRepo.Save(ctx, result); err != nil {
 		return nil, fmt.Errorf("failed to save discovery result: %w", err)
 	}
+
+	o.persistSplitLogs(ctx, result.ID, explorationResult.Steps, analysisLog, allValidation, recStep)
 
 	// Phase 9: Embed & Index (non-fatal — errors logged, discovery still completes)
 	if o.embedIndexStore != nil {
@@ -810,6 +853,40 @@ func (o *Orchestrator) RunDiscovery(ctx context.Context, opts DiscoveryOptions) 
 	}).Info("Discovery run completed")
 
 	return result, nil
+}
+
+// persistSplitLogs writes the per-step / per-area / per-result rows into
+// their dedicated collections. Failures are logged and swallowed: the parent
+// DiscoveryResult is already persisted, and rolling back over a log-write
+// hiccup would lose the structured outputs (insights, recommendations,
+// summary). Background: embedded arrays previously here blew past the 16MB
+// BSON document limit on long runs. See database/discovery_log_repo.go.
+//
+// When discoveryLogRepo is nil (test or single-binary builds without
+// MongoDB), this is a no-op.
+func (o *Orchestrator) persistSplitLogs(
+	ctx context.Context,
+	discoveryID string,
+	explorationSteps []models.ExplorationStep,
+	analysisSteps []models.AnalysisStep,
+	validations []models.ValidationResult,
+	recStep *models.RecommendationStep,
+) {
+	if o.discoveryLogRepo == nil {
+		return
+	}
+	if err := o.discoveryLogRepo.SaveExplorationSteps(ctx, o.projectID, discoveryID, o.runID, explorationSteps); err != nil {
+		applog.WithError(err).Warn("Failed to persist exploration steps to split collection")
+	}
+	if err := o.discoveryLogRepo.SaveAnalysisSteps(ctx, o.projectID, discoveryID, o.runID, analysisSteps); err != nil {
+		applog.WithError(err).Warn("Failed to persist analysis steps to split collection")
+	}
+	if err := o.discoveryLogRepo.SaveValidationResults(ctx, o.projectID, discoveryID, o.runID, validations); err != nil {
+		applog.WithError(err).Warn("Failed to persist validation results to split collection")
+	}
+	if err := o.discoveryLogRepo.SaveRecommendationLog(ctx, o.projectID, discoveryID, o.runID, recStep); err != nil {
+		applog.WithError(err).Warn("Failed to persist recommendation log to split collection")
+	}
 }
 
 // parseInsights parses LLM response JSON into Insight structs.

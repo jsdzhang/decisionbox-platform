@@ -278,9 +278,10 @@ export interface DiscoveryResult {
   insights: Insight[];
   recommendations: Recommendation[];
   summary: Summary;
-  exploration_log?: ExplorationStep[];
-  analysis_log?: AnalysisLogStep[];
-  validation_log?: ValidationLogEntry[];
+  // Logs are no longer embedded — fetch them from the dedicated endpoints
+  // when needed (each has its own GET under /api/v1/discoveries/{id}/...).
+  // The previous embedded arrays hit the 16MB BSON document limit on long
+  // runs and killed the discovery save.
   created_at: string;
 }
 
@@ -486,7 +487,10 @@ export interface DiscoveryRunStatus {
   updated_at: string;
   completed_at: string | null;
   error: string;
-  steps: RunStep[];
+  // Per-step rows live in the discovery_run_steps collection now and are
+  // streamed via api.listRunSteps(runId, sinceID). The legacy embedded
+  // `steps` array is gone — see PR splitting them out for the 16MB
+  // BSON limit.
   total_queries: number;
   successful_queries: number;
   failed_queries: number;
@@ -500,7 +504,11 @@ export interface DiscoveryRunStatus {
   analysis_steps_dropped?: number;
 }
 
+// RunStep is one row in the live run-step stream. `id` is the opaque
+// cursor — the dashboard echoes the last row's `id` back as `since`
+// on the next poll. The other fields are the per-step semantic data.
 export interface RunStep {
+  id: string;
   phase: string;
   step_num: number;
   timestamp: string;
@@ -952,6 +960,31 @@ export const api = {
     request<DiscoveryResult>(`/api/v1/projects/${projectId}/discoveries/latest`),
   getDiscoveryById: (discoveryId: string) =>
     request<DiscoveryResult>(`/api/v1/discoveries/${discoveryId}`),
+  // Per-discovery split-log endpoints. The previous embedded
+  // exploration_log / analysis_log / validation_log arrays were removed
+  // from the DiscoveryResult document to keep it under Mongo's 16MB
+  // limit; these are how the dashboard rehydrates the LLM dialog.
+  listExplorationSteps: (discoveryId: string, limit?: number) => {
+    const qs = limit ? `?limit=${limit}` : '';
+    return request<ExplorationStep[]>(`/api/v1/discoveries/${discoveryId}/exploration-steps${qs}`);
+  },
+  listAnalysisSteps: (discoveryId: string) =>
+    request<AnalysisLogStep[]>(`/api/v1/discoveries/${discoveryId}/analysis-steps`),
+  listValidationResults: (discoveryId: string) =>
+    request<ValidationLogEntry[]>(`/api/v1/discoveries/${discoveryId}/validation-results`),
+  getRecommendationLog: (discoveryId: string) =>
+    request<{ run_at: string; insight_count: number; tokens_in?: number; tokens_out?: number; duration_ms?: number; error?: string }>(`/api/v1/discoveries/${discoveryId}/recommendation-log`),
+  // Live run-step stream. The dashboard polls with the last `id` it
+  // has rendered (opaque cursor); the server returns rows strictly
+  // after that id, ordered by ObjectID. ms-precision timestamps would
+  // collide and silently drop rows — see services/api/database/run_step_repo.go.
+  listRunSteps: (runId: string, sinceID?: string, limit?: number) => {
+    const params = new URLSearchParams();
+    if (sinceID) params.set('since', sinceID);
+    if (limit) params.set('limit', String(limit));
+    const qs = params.toString();
+    return request<RunStep[]>(`/api/v1/runs/${runId}/steps${qs ? '?' + qs : ''}`);
+  },
   getDiscoveryByDate: (projectId: string, date: string) =>
     request<DiscoveryResult>(`/api/v1/projects/${projectId}/discoveries/${date}`),
   getProjectStatus: (projectId: string) =>

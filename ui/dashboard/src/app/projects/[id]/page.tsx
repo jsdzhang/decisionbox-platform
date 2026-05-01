@@ -347,9 +347,11 @@ export default function ProjectPage() {
         </div>
       )}
 
-      {/* Live Run Panel */}
+      {/* Live Run Panel — keyed on run.id so a new run cleanly remounts
+          the panel (fresh steps state + cursor) instead of needing an
+          in-component reset effect. */}
       {showRunPanel && run && (
-        <LiveRunPanel run={run} onCancel={async () => {
+        <LiveRunPanel key={run.id} run={run} onCancel={async () => {
           if (justFinished) {
             dismissedRunId.current = run.id;
             setRun(null);
@@ -519,10 +521,54 @@ function DiscoveryRunCard({ discovery: d, projectId }: { discovery: DiscoveryRes
 /* ========== Live Run Panel ========== */
 
 function LiveRunPanel({ run, onCancel }: { run: DiscoveryRunStatus; onCancel: () => void }) {
-  const steps = run.steps || [];
+  // Per-step rows are no longer embedded in the run doc — they live in
+  // discovery_run_steps and are streamed via api.listRunSteps with an
+  // opaque ObjectID cursor (the last `id` we have). We poll while the
+  // run is live and stop after it terminates. Polling is self-scheduling
+  // (await-then-schedule) rather than setInterval, so a slow network
+  // can never overlap two `since`-equal requests and produce duplicate
+  // rows.
+  const [steps, setSteps] = useState<RunStep[]>([]);
+  const lastIDRef = useRef<string>('');
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const userScrolledUp = useRef(false);
   const prevStepCount = useRef(0);
+
+  // The parent renders <LiveRunPanel key={run.id}> so a new run
+  // remounts this component with fresh `steps` / `lastIDRef` state
+  // automatically — no in-component reset effect needed (which the
+  // react-hooks/set-state-in-effect lint rule rightly flags as a
+  // cascading-render anti-pattern).
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+    const isTerminal = (s: string) => s === 'completed' || s === 'failed' || s === 'cancelled';
+    const tick = async () => {
+      try {
+        const next = await api.listRunSteps(run.id, lastIDRef.current || undefined);
+        if (cancelled) return;
+        if (next.length) {
+          lastIDRef.current = next[next.length - 1].id;
+          setSteps(prev => prev.concat(next));
+        }
+      } catch {
+        // Network blips are tolerable — the next tick will retry.
+      }
+      if (cancelled) return;
+      // Self-scheduling: only arm the next poll AFTER this one
+      // resolves, so we never have two listRunSteps calls in flight
+      // sharing the same cursor.
+      if (!isTerminal(run.status)) {
+        timer = window.setTimeout(tick, 1500);
+      }
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [run.id, run.status]);
 
   useEffect(() => {
     if (steps.length > prevStepCount.current && !userScrolledUp.current && scrollRef.current) {
