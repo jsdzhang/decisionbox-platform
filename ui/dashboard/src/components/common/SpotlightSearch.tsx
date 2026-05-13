@@ -8,6 +8,7 @@ import {
 } from '@tabler/icons-react';
 import { SeverityBadge } from './UIComponents';
 import { api, SearchResultItem, SearchHistoryEntry } from '@/lib/api';
+import { searchResultHref } from '@/lib/searchNav';
 
 const EXAMPLE_QUERIES = [
   { text: 'Why are users churning?', icon: IconTrendingUp },
@@ -84,7 +85,11 @@ export default function SpotlightSearch() {
   const navigate = useCallback((item: SearchResultItem) => {
     setOpen(false);
     setQuery('');
-    router.push(`/projects/${item.project_id || projectId}/discoveries/${item.discovery_id}`);
+    // `navigate` is only reachable through dropdown rows, which only
+    // render when `projectId` is truthy (showDropdown gate below) — so
+    // the non-null assertion matches a real invariant rather than
+    // papering over an unhandled case.
+    router.push(searchResultHref(item, projectId!));
   }, [router, projectId]);
 
   const goToSearch = useCallback((q: string) => {
