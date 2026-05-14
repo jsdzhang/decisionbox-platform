@@ -102,13 +102,16 @@ Aggregate stats for a discovery run.
 
 ## ExplorationStep
 
-One step in the autonomous exploration phase. Represents a single LLM call + SQL query.
+One step in the autonomous exploration phase. Drives one user-visible
+exploration turn — usually one LLM call, but a turn whose response can't
+be parsed is retried (up to a small retry budget) and every retry's
+token usage is summed onto the same step.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `step` | int | Step number (1-based) |
 | `timestamp` | timestamp | When this step ran |
-| `action` | string | Always `query_data` |
+| `action` | string | One of `query_data`, `lookup_schema`, `search_tables`, `complete`, `complete_rejected` |
 | `thinking` | string | AI's reasoning for this query |
 | `query_purpose` | string | Short description of query intent |
 | `query` | string | The SQL query executed |
@@ -116,6 +119,8 @@ One step in the autonomous exploration phase. Represents a single LLM call + SQL
 | `execution_time_ms` | int64 | Query execution time in milliseconds |
 | `error` | string | Error message if query failed |
 | `fixed` | bool | True if the query was auto-fixed after a SQL error |
+| `tokens_in` | int | Input tokens consumed (sum across any parse-retry rounds on this step) |
+| `tokens_out` | int | Output tokens generated (sum across any parse-retry rounds on this step) |
 
 ## AnalysisStep
 
@@ -147,6 +152,8 @@ Warehouse verification of an insight's claims.
 | `reasoning` | string | Explanation of the result |
 | `query` | string | The verification SQL query |
 | `validated_at` | timestamp | When validation was performed |
+| `input_tokens` | int | Input tokens summed across every verifier LLM call for this insight (initial verification, lookup-loop rounds, forced final round). Omitted on legacy rows. |
+| `output_tokens` | int | Output tokens summed across the same set. Omitted on legacy rows. |
 
 ## DiscoveryRunStatus
 

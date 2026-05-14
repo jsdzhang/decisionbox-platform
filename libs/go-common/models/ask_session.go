@@ -29,8 +29,11 @@ type AskSessionMessage struct {
 	Sources    []AskSessionSource `bson:"sources" json:"sources"`
 	ToolEvents []ToolEvent        `bson:"tool_events,omitempty" json:"tool_events,omitempty"`
 	Model      string             `bson:"model" json:"model"`
-	TokensUsed int                `bson:"tokens_used" json:"tokens_used"`
-	CreatedAt  time.Time          `bson:"created_at" json:"created_at"`
+	// omitempty so legacy rows render as absent rather than 0 —
+	// distinguishes "unknown" from "zero spent."
+	InputTokens  int       `bson:"input_tokens,omitempty" json:"input_tokens,omitempty"`
+	OutputTokens int       `bson:"output_tokens,omitempty" json:"output_tokens,omitempty"`
+	CreatedAt    time.Time `bson:"created_at" json:"created_at"`
 }
 
 // AskSessionSource is a reference to an insight or recommendation used as context.

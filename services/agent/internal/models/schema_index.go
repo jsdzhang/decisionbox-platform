@@ -29,6 +29,13 @@ type BlurbLLMConfig struct {
 }
 
 // SchemaIndexProgress is the live worker-emitted progress document.
+//
+// There is exactly one Mongo doc per project (upserted / overwritten on
+// each build), so "tokens spent on the most recent schema-index" is a
+// one-document read. `project_schema_index_logs` records per-line
+// stdout/stderr (not per-build totals), so the progress doc is the
+// home. Per-blurb tokens are summed onto this single doc via
+// IncrementTokens; the Qdrant payload is untouched.
 type SchemaIndexProgress struct {
 	ProjectID    string    `bson:"project_id" json:"project_id"`
 	RunID        string    `bson:"run_id,omitempty" json:"run_id,omitempty"`
@@ -38,4 +45,10 @@ type SchemaIndexProgress struct {
 	StartedAt    time.Time `bson:"started_at" json:"started_at"`
 	UpdatedAt    time.Time `bson:"updated_at" json:"updated_at"`
 	ErrorMessage string    `bson:"error_message,omitempty" json:"error_message,omitempty"`
+
+	// Per-build blurb-LLM token totals, summed across every successful
+	// blurb call in the current build. Reset to zero on Reset();
+	// accumulated via IncrementTokens.
+	InputTokens  int `bson:"input_tokens,omitempty" json:"input_tokens,omitempty"`
+	OutputTokens int `bson:"output_tokens,omitempty" json:"output_tokens,omitempty"`
 }

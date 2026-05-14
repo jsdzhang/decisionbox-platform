@@ -56,6 +56,12 @@ type InsightValidation struct {
 	OriginalCount int       `bson:"original_count,omitempty" json:"original_count,omitempty"`
 	Reasoning     string    `bson:"reasoning,omitempty" json:"reasoning,omitempty"`
 	ValidatedAt   time.Time `bson:"validated_at" json:"validated_at"`
+
+	// Per-insight LLM token usage, summed across every verifier LLM
+	// call for this insight. Mirror of the agent-side field; populated
+	// when the verifier writes the insight validation embed.
+	InputTokens  int `bson:"input_tokens,omitempty" json:"input_tokens,omitempty"`
+	OutputTokens int `bson:"output_tokens,omitempty" json:"output_tokens,omitempty"`
 }
 
 // BuildEmbeddingText returns the text to embed for semantic search.

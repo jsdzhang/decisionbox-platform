@@ -27,8 +27,12 @@ type ExecutiveSummary struct {
 
 	GeneratedAt time.Time `bson:"generated_at" json:"generated_at"`
 	GeneratedBy string    `bson:"generated_by" json:"generated_by"`
-	TokensUsed  int       `bson:"tokens_used,omitempty" json:"tokens_used,omitempty"`
-	DurationMS  int64     `bson:"duration_ms,omitempty" json:"duration_ms,omitempty"`
+	// Per-summary LLM token usage, summed across every section call the
+	// generator made for this document. The community module owns the
+	// field shape so the enterprise generator + store can pin to it.
+	InputTokens  int   `bson:"input_tokens,omitempty" json:"input_tokens,omitempty"`
+	OutputTokens int   `bson:"output_tokens,omitempty" json:"output_tokens,omitempty"`
+	DurationMS   int64 `bson:"duration_ms,omitempty" json:"duration_ms,omitempty"`
 
 	// Status is one of:
 	//   "generating" — generator running, document is a placeholder
