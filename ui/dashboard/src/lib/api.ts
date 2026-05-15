@@ -2,6 +2,86 @@
 // proxy them to the backend API server-side. No direct browser-to-API calls.
 const API_BASE = '';
 
+/**
+ * ApiError is thrown by `request()` for every non-2xx response. The
+ * `code` field carries the machine-readable error identifier the
+ * backend sets (e.g. "embedding_not_configured", "context_overflow")
+ * so callers can branch on condition without parsing message text.
+ *
+ * `details` is the upstream-sanitised explanation; surface it in a
+ * "what happened" expander, not as the primary message.
+ *
+ * Callers that do `catch (err) { console.log(err.message) }` keep
+ * working — ApiError extends Error and preserves the message field.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly details?: string;
+
+  constructor(message: string, status: number, code?: string, details?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
+/**
+ * Machine-readable error codes the API returns on /ask. Keep this
+ * union in sync with the constants exported from
+ * services/api/internal/handler/response.go — the two pieces of code
+ * cross the network, and the dashboard pattern-matches against the
+ * exact strings.
+ */
+export type AskErrorCode =
+  | 'embedding_not_configured'
+  | 'llm_not_configured'
+  | 'context_overflow'
+  | 'llm_upstream'
+  | 'llm_synthesis_failed';
+
+/**
+ * Maps an /ask error (typed ApiError or unknown) to the user-facing
+ * sentence rendered in the chat transcript. Centralised here so:
+ *
+ *   1. The Ask page, any future "explain to me" toast, and the
+ *      sessions list can render consistent copy.
+ *   2. Adding a new typed code is a one-line change in the switch.
+ *
+ * Returns the generic "could not answer" string for any non-ApiError,
+ * any ApiError without a recognised `code`, and any new code the
+ * backend ships before this switch knows about it — surfacing raw
+ * backend `message` text in those cases would leak provider internals
+ * and break the consistent-copy contract above.
+ */
+export function askErrorMessage(err: unknown): string {
+  const generic = 'Sorry, I could not answer this question. Try again, or start a new chat.';
+  if (!(err instanceof ApiError)) {
+    return generic;
+  }
+  switch (err.code as AskErrorCode | undefined) {
+    case 'embedding_not_configured':
+      return "This project has no embedding provider configured. Add one under project settings → Embedding to enable Ask.";
+    case 'llm_not_configured':
+      return "This project has no LLM provider configured. Add one under project settings → LLM to enable Ask.";
+    case 'context_overflow':
+      return "This conversation has grown past the model's context window. Start a new chat, or switch to a model with a wider context window.";
+    case 'llm_upstream':
+      // Per the ApiError doc, `details` is surfaced in a secondary
+      // "what happened" expander, never inlined in the primary
+      // sentence — otherwise a leaky upstream message becomes part
+      // of the headline copy. Callers that want to render the
+      // detail can read err.details directly off the ApiError.
+      return 'The LLM provider rejected the request. Try again in a moment; if it keeps happening, check your provider credentials and quota.';
+    case 'llm_synthesis_failed':
+      return 'The LLM provider failed to answer this question. Try again, or start a new chat.';
+    default:
+      return generic;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}${path}`;
 
@@ -18,17 +98,45 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       headers: { ...headers, ...options?.headers as Record<string, string> },
     });
   } catch (err) {
-    throw new Error(
+    throw new ApiError(
       `Cannot connect to DecisionBox API at ${API_BASE}. ` +
       `Make sure the API is running (make dev-api or docker compose up). ` +
-      `Original error: ${(err as Error).message}`
+      `Original error: ${(err as Error).message}`,
+      0,
     );
   }
 
-  const json = await res.json();
+  // Some paths (Next.js proxy 502, misconfigured upstream returning
+  // HTML 200, network blip) return non-JSON bodies. Guard against
+  // res.json() throwing on either branch so the caller always sees a
+  // meaningful ApiError instead of a silent `undefined` success or a
+  // raw SyntaxError.
+  let json: { data?: unknown; error?: string; code?: string; details?: string } = {};
+  let parseFailed = false;
+  try {
+    json = await res.json();
+  } catch {
+    parseFailed = true;
+  }
 
   if (!res.ok) {
-    throw new Error(json.error || `API error: ${res.status}`);
+    throw new ApiError(
+      json.error || `API error: ${res.status}`,
+      res.status,
+      json.code,
+      json.details,
+    );
+  }
+
+  // 2xx with an unparseable body is treated as a server error rather
+  // than returning `undefined` to the caller. Surfacing this loudly
+  // makes the actual failure mode (misconfigured proxy / non-JSON
+  // upstream) discoverable instead of producing mystery null derefs.
+  if (parseFailed) {
+    throw new ApiError(
+      `API error: ${res.status} returned a non-JSON body`,
+      res.status,
+    );
   }
 
   return json.data as T;

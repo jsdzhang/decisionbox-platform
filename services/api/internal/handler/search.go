@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	goembedding "github.com/decisionbox-io/decisionbox/libs/go-common/embedding"
@@ -464,7 +463,10 @@ func (h *SearchHandler) Ask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if project.Embedding.Provider == "" {
-		writeError(w, http.StatusBadRequest, "embedding provider not configured")
+		writeErrorCode(w, http.StatusPreconditionFailed,
+			ErrCodeEmbeddingNotConfigured,
+			"embedding provider not configured for this project",
+			"")
 		return
 	}
 
@@ -540,24 +542,6 @@ func (h *SearchHandler) Ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build context from insights/recommendations for LLM (cited as [1], [2], ...)
-	var contextParts []string
-	for i, s := range insights {
-		contextParts = append(contextParts, fmt.Sprintf("[%d] %s: %s (score: %.2f)", i+1, s.Name, s.Description, s.Score))
-	}
-	contextStr := strings.Join(contextParts, "\n")
-
-	// Append knowledge source chunks (cited as [s1], [s2], ...) using the same
-	// formatter the agent uses, so prompt structure is consistent across the platform.
-	knowledgeSection := gosources.FormatPromptSection(knowledgeChunks)
-
-	// Call LLM to synthesize answer
-	llmProvider, err := h.createLLMProvider(ctx, project, projectID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create LLM provider")
-		return
-	}
-
 	// Output language is driven by Project.Language (Empty falls back to
 	// "English" via EffectiveLanguage). The directive is explicit so the
 	// model translates context that may already be in another language
@@ -572,9 +556,99 @@ func (h *SearchHandler) Ask(w http.ResponseWriter, r *http.Request) {
 		project.EffectiveLanguage(),
 	)
 
-	prompt := fmt.Sprintf("Context from %d relevant insights/recommendations:\n\n%s\n\n%s\nQuestion: %s", len(insights), contextStr, knowledgeSection, req.Question)
+	llmProvider, err := h.createLLMProvider(ctx, project, projectID)
+	if err != nil {
+		writeErrorCode(w, http.StatusPreconditionFailed,
+			ErrCodeLLMNotConfigured,
+			"LLM provider not configured for this project",
+			err.Error())
+		return
+	}
 
-	// Build messages with conversation history from session for multi-turn context
+	// Token-aware prompt assembly. The budget walk uses
+	// gollm.ApproximateCounter throughout (rune/4) for two reasons:
+	//
+	//  1. Trim/shrink decisions touch every history pair, every RAG
+	//     shrink iteration, and the assembled prompt — call counts
+	//     scale with session size. With an exact counter that makes
+	//     a network round-trip (Anthropic /count_tokens, Vertex
+	//     :countTokens), the per-Ask latency would balloon by
+	//     20–100×.
+	//  2. The 15% approximate-tier safety margin is wide enough to
+	//     absorb rune/4's drift on every prompt shape we've seen
+	//     (English, code, CJK, mixed).
+	//
+	// We then do ONE exact verification on the assembled request
+	// (system + history + prompt) via the provider's
+	// TokenCounterProvider (Claude /count_tokens, OpenAI tiktoken,
+	// Vertex Gemini :countTokens, …). If exact reveals an overflow
+	// the approximate walk missed, the gate returns 413. If the
+	// provider has no exact counter (Bedrock, Ollama, …), the
+	// approximate walk's 15% margin is the safety net.
+	counter := gollm.ApproximateCounter{}
+	modelMaxInput := gollm.GetMaxInputTokens(project.LLM.Provider, project.LLM.Model)
+	budget := gollm.NewBudget(modelMaxInput, askMaxOutputTokens, askReservedSystemTokens, false)
+
+	questionTokens, _ := counter.Count(ctx, req.Question)
+	available := budget.Available() - questionTokens
+	if available <= 0 {
+		writeErrorCode(w, http.StatusRequestEntityTooLarge,
+			ErrCodeContextOverflow,
+			"the question alone exceeds this model's input window",
+			fmt.Sprintf("model=%s window=%d question_tokens=%d",
+				project.LLM.Model, modelMaxInput, questionTokens))
+		return
+	}
+
+	// Knowledge section is fixed for this turn (the retriever already
+	// chose top-K), so count it once and have the RAG shrink loop
+	// account for it as a fixed cost. Otherwise a project with
+	// large knowledge sources could pass the per-RAG budget but still
+	// overflow once knowledge is added.
+	knowledgeSection := gosources.FormatPromptSection(knowledgeChunks)
+	knowledgeTokens, _ := counter.Count(ctx, knowledgeSection)
+
+	ragBudget := available - knowledgeTokens
+	contextStr, ragTokens, keptInsights, _ := fitRAGContext(ctx, counter, insights, ragBudget)
+
+	// If RAG context + knowledge still overflows even at the
+	// askMinRAGItems floor, surface a typed 413 rather than letting
+	// the provider 4xx with a generic message.
+	if ragTokens+knowledgeTokens > available && keptInsights <= askMinRAGItems {
+		writeErrorCode(w, http.StatusRequestEntityTooLarge,
+			ErrCodeContextOverflow,
+			"retrieved context plus this question exceeds the model's input window",
+			fmt.Sprintf("model=%s window=%d question=%d rag=%d knowledge=%d",
+				project.LLM.Model, modelMaxInput, questionTokens, ragTokens, knowledgeTokens))
+		return
+	}
+
+	prompt := fmt.Sprintf("Context from %d relevant insights/recommendations:\n\n%s\n\n%s\nQuestion: %s", keptInsights, contextStr, knowledgeSection, req.Question)
+	promptTokens, _ := counter.Count(ctx, prompt)
+
+	// The earlier "rag + knowledge > available" check counts the raw
+	// citation + chunk bodies but not the wrapping prompt scaffolding
+	// ("Context from N relevant insights/recommendations:\n\n…
+	// Question: …"). On tight budgets that wrapper can be the
+	// difference between fitting and overflowing, so we surface the
+	// 413 here rather than letting the provider 4xx.
+	if promptTokens > budget.Available() {
+		writeErrorCode(w, http.StatusRequestEntityTooLarge,
+			ErrCodeContextOverflow,
+			"the assembled question + retrieved context exceeds this model's input window",
+			fmt.Sprintf("model=%s window=%d prompt_tokens=%d available=%d",
+				project.LLM.Model, modelMaxInput, promptTokens, budget.Available()))
+		return
+	}
+
+	// Budget remaining for history = Available - prompt-shaped tokens.
+	// The prompt already includes the question + RAG + knowledge; we
+	// don't double-count.
+	historyBudget := budget.Available() - promptTokens
+
+	// Build messages with conversation history from session for
+	// multi-turn context. The walk drops oldest pairs first; the
+	// current user prompt always rides at the end.
 	var messages []gollm.Message
 	if req.SessionID != "" {
 		session, err := h.sessionRepo.GetByID(ctx, req.SessionID)
@@ -583,19 +657,26 @@ func (h *SearchHandler) Ask(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, "session does not belong to this project")
 				return
 			}
-			msgs := session.Messages
-			if len(msgs) > 10 {
-				msgs = msgs[len(msgs)-10:]
-			}
-			for _, m := range msgs {
-				messages = append(messages,
-					gollm.Message{Role: "user", Content: m.Question},
-					gollm.Message{Role: "assistant", Content: m.Answer},
-				)
-			}
+			trimmed, _ := trimMessagesByTokens(ctx, session.Messages, counter, historyBudget)
+			messages = append(messages, trimmed...)
 		}
 	}
 	messages = append(messages, gollm.Message{Role: "user", Content: prompt})
+
+	// Single exact verification on the fully assembled request.
+	// Catches the rare case where the approximate walk under-counted
+	// enough to slip past the budget but exact reveals an actual
+	// overflow. Provider exact counter not available, transient
+	// upstream error, or context-cancelled → silently fall through
+	// and let provider report any overflow as a typed 413 via
+	// classifyLLMError below.
+	if overflow, ok := verifyExactPromptFits(ctx, llmProvider, project.LLM.Model, systemPrompt, messages, modelMaxInput); ok && overflow != nil {
+		writeErrorCode(w, http.StatusRequestEntityTooLarge,
+			ErrCodeContextOverflow,
+			"the assembled prompt exceeds the model's input window (verified via exact counter)",
+			overflow.Error())
+		return
+	}
 
 	// Temperature omitted: Bedrock + direct Anthropic reject the field
 	// on Opus 4.x extended-thinking models. Synthesis already grounds the
@@ -605,10 +686,11 @@ func (h *SearchHandler) Ask(w http.ResponseWriter, r *http.Request) {
 		Model:        project.LLM.Model,
 		SystemPrompt: systemPrompt,
 		Messages:     messages,
-		MaxTokens:    2048,
+		MaxTokens:    askMaxOutputTokens,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LLM synthesis failed")
+		status, code, msg, details := classifyLLMError(err)
+		writeErrorCode(w, status, code, msg, details)
 		return
 	}
 
