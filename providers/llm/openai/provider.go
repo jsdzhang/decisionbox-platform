@@ -35,9 +35,9 @@ const openaiDefaultTimeout = 5 * time.Minute
 
 func init() {
 	gollm.RegisterWithMeta("openai", func(cfg gollm.ProviderConfig) (gollm.Provider, error) {
-		apiKey := cfg["api_key"]
+		apiKey := cfg["credentials_json"]
 		if apiKey == "" {
-			return nil, fmt.Errorf("openai: api_key is required")
+			return nil, fmt.Errorf("openai: API key is required")
 		}
 
 		model := cfg["model"]
@@ -56,7 +56,6 @@ func init() {
 		Name:        "OpenAI",
 		Description: "OpenAI API - GPT-4o, GPT-4o-mini, and compatible APIs",
 		ConfigFields: []gollm.ConfigField{
-			{Key: "api_key", Label: "API Key", Required: true, Type: "string", Placeholder: "sk-..."},
 			{
 				Key:         "model",
 				Label:       "Model",
@@ -68,7 +67,17 @@ func init() {
 			},
 			{Key: "base_url", Label: "Base URL", Type: "string", Default: "https://api.openai.com/v1", Description: "For OpenAI-compatible APIs"},
 		},
+		AuthMethods: []gollm.AuthMethod{
+			{
+				ID: "api_key", Name: "API Key",
+				Description: "OpenAI API key (or compatible API key for self-hosted gateways).",
+				Fields: []gollm.ConfigField{
+					{Key: "credentials_json", Label: "API Key", Required: true, Type: "credential", Placeholder: "sk-..."},
+				},
+			},
+		},
 		Models:                 buildOpenAICatalog(),
+		FamilyInferrer:         inferOpenAIWire,
 		DefaultMaxOutputTokens: 16384,
 		// OpenAI's chat-completions endpoint supports function calling on
 		// gpt-4o, gpt-4o-mini, gpt-4.1, gpt-4.1-mini. Reasoning models

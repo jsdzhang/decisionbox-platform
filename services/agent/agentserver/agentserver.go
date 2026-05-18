@@ -77,7 +77,7 @@ func Run() {
 		testMode        = flag.Bool("test", false, "Test mode - limit analyses for faster testing")
 		enableDebugLogs = flag.Bool("enable-debug-logs", true, "Enable detailed debug logging to MongoDB")
 		estimateOnly    = flag.Bool("estimate", false, "Estimate cost only (no actual discovery)")
-		testConnection  = flag.String("test-connection", "", "Test provider connection: 'warehouse' or 'llm'")
+		testConnection  = flag.String("test-connection", "", "Test provider connection: 'warehouse', 'llm', 'embedding', or 'blurb-llm'")
 		mode            = flag.String("mode", "", "Alternate run mode: 'index-schema' to build the project's schema retrieval index and exit; 'pack-gen' to generate a domain pack for the project and exit (enterprise feature). Default: run discovery.")
 	)
 
@@ -244,7 +244,7 @@ func initWarehouseProvider(ctx context.Context, project *models.Project, secretP
 	if err == nil && whCreds != "" {
 		whCfg["credentials_json"] = whCreds
 		applog.Info("Warehouse credentials loaded from secret provider")
-	} else if err != nil && err != gosecrets.ErrNotFound {
+	} else if err != nil && !errors.Is(err, gosecrets.ErrNotFound) {
 		applog.WithError(err).Warn("Failed to read warehouse credentials from secret provider")
 	}
 
@@ -302,52 +302,62 @@ func initQdrant(ctx context.Context, cfg *config.Config) (vectorstore.Provider, 
 	}, nil
 }
 
+// resolveCredential applies the platform's credential-resolution order
+// to a single slot: dashboard secret wins, env var is fallback, ambient
+// (handled downstream by the provider factory for cloud auth methods) is
+// last. The returned source string is one of "dashboard", "env", or
+// "none" and is logged so operators can see where the credential came
+// from.
+func resolveCredential(ctx context.Context, secretProvider gosecrets.Provider, projectID, secretKey, envVar string) (value, source string) {
+	if v, err := secretProvider.Get(ctx, projectID, secretKey); err == nil && v != "" {
+		return v, "dashboard"
+	} else if err != nil && !errors.Is(err, gosecrets.ErrNotFound) {
+		// Use errors.Is — gcp/aws/azure secret providers wrap their
+		// backend errors with %w, so a wrapped ErrNotFound would not
+		// compare equal via `!=`. Mongo returns the sentinel directly,
+		// which is why both forms appear correct in unit tests; only
+		// the wrapped path matters in production for the cloud
+		// backends.
+		applog.WithError(err).WithField("secret_key", secretKey).Warn("Failed to read credential from secret provider")
+	}
+	if v := os.Getenv(envVar); v != "" {
+		return v, "env"
+	}
+	return "", "none"
+}
+
 func initEmbeddingProvider(ctx context.Context, project *models.Project, secretProvider gosecrets.Provider, projectID string) (goembedding.Provider, error) {
-	// When BYOK_EMBEDDING_ENABLED is false, EMBEDDING_PROVIDER_API_KEY
-	// from the environment wins over project-supplied credentials.
-	// Setting the flag to true flips the priority so project credentials
-	// take precedence.
-	byok := os.Getenv("BYOK_EMBEDDING_ENABLED") == "true"
-
-	// Fill project.Credentials from the secret provider when the project
-	// does not already carry a UI-supplied key (the UI writes credentials
-	// directly into project.Embedding.Credentials; older deployments
-	// stored the key in the secret provider under "embedding-api-key").
-	if project.Embedding.Credentials == "" {
-		key, err := secretProvider.Get(ctx, projectID, "embedding-api-key")
-		if err == nil && key != "" {
-			project.Embedding.Credentials = key
-			applog.Info("Embedding API key loaded from secret provider")
-		} else if err != nil && err != gosecrets.ErrNotFound {
-			applog.WithError(err).Warn("Failed to read embedding API key from secret provider")
-		}
+	if project.Embedding.Provider == "" {
+		applog.Info("Embedding provider not configured — Phase 9 will skip embedding")
+		return nil, nil
 	}
 
-	resolved, err := goembedding.ResolveConfig(project.Embedding, byok)
-	if err != nil {
-		if errors.Is(err, goembedding.ErrNoProvider) {
-			applog.Info("Embedding provider not configured — Phase 9 will skip embedding")
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to resolve embedding config: %w", err)
-	}
+	credential, source := resolveCredential(ctx, secretProvider, projectID, "embedding-credentials", "EMBEDDING_API_KEY")
 
 	embCfg := goembedding.ProviderConfig{
-		"api_key": resolved.APIKey,
-		"model":   resolved.Model,
+		"credentials_json": credential,
+		"model":            project.Embedding.Model,
+	}
+	// Copy provider-specific non-credential config (auth_method,
+	// region, project_id, location, role_arn, external_id, …) from
+	// the project document so Bedrock / Vertex factories see what the
+	// dashboard saved. project.Embedding.Config is the map the
+	// dashboard writes when the user picks an auth method or enters
+	// method-specific fields.
+	for k, v := range project.Embedding.Config {
+		embCfg[k] = v
 	}
 
-	provider, err := goembedding.NewProvider(resolved.Provider, embCfg)
+	provider, err := goembedding.NewProvider(project.Embedding.Provider, embCfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create embedding provider (%s): %w", resolved.Provider, err)
+		return nil, fmt.Errorf("failed to create embedding provider (%s): %w", project.Embedding.Provider, err)
 	}
 
 	applog.WithFields(applog.Fields{
-		"provider":        resolved.Provider,
-		"model":           resolved.Model,
-		"dims":            provider.Dimensions(),
-		"credential_src":  resolved.Source,
-		"byok_enabled":    byok,
+		"provider":       project.Embedding.Provider,
+		"model":          project.Embedding.Model,
+		"dims":           provider.Dimensions(),
+		"credential_src": source,
 	}).Info("Embedding provider initialized")
 
 	return provider, nil
@@ -358,17 +368,10 @@ func initLLMProvider(ctx context.Context, cfg *config.Config, project *models.Pr
 		return nil, fmt.Errorf("no LLM provider configured")
 	}
 
-	apiKey := ""
-	key, err := secretProvider.Get(ctx, projectID, "llm-api-key")
-	if err == nil && key != "" {
-		apiKey = key
-		applog.Info("LLM API key loaded from secret provider")
-	} else if err != nil && err != gosecrets.ErrNotFound {
-		applog.WithError(err).Warn("Failed to read LLM API key from secret provider")
-	}
+	credential, source := resolveCredential(ctx, secretProvider, projectID, "llm-credentials", "LLM_API_KEY")
 
 	llmCfg := gollm.ProviderConfig{
-		"api_key":          apiKey,
+		"credentials_json": credential,
 		"model":            project.LLM.Model,
 		"max_retries":      strconv.Itoa(cfg.LLM.MaxRetries),
 		"timeout_seconds":  strconv.Itoa(int(cfg.LLM.Timeout.Seconds())),
@@ -396,8 +399,9 @@ func initLLMProvider(ctx context.Context, cfg *config.Config, project *models.Pr
 	}
 
 	applog.WithFields(applog.Fields{
-		"provider": project.LLM.Provider,
-		"model":    project.LLM.Model,
+		"provider":       project.LLM.Provider,
+		"model":          project.LLM.Model,
+		"credential_src": source,
 	}).Info("LLM provider initialized")
 
 	return provider, nil
@@ -406,8 +410,10 @@ func initLLMProvider(ctx context.Context, cfg *config.Config, project *models.Pr
 // --- Test connection ---
 
 func runTestConnection(cfg *config.Config, projectID, target string) error {
-	if target != "warehouse" && target != "llm" {
-		return fmt.Errorf("invalid test target %q: must be 'warehouse' or 'llm'", target)
+	switch target {
+	case "warehouse", "llm", "embedding", "blurb-llm":
+	default:
+		return fmt.Errorf("invalid test target %q: must be 'warehouse', 'llm', 'embedding', or 'blurb-llm'", target)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -482,6 +488,76 @@ func runTestConnection(cfg *config.Config, projectID, target string) error {
 		}
 		fmt.Println(string(out))
 
+	case "embedding":
+		provider, err := initEmbeddingProvider(ctx, project, secretProvider, projectID)
+		if err != nil {
+			return err
+		}
+		if provider == nil {
+			return fmt.Errorf("embedding provider not configured")
+		}
+		// Issue a minimal embed call so credentials + model availability
+		// are both checked end-to-end.
+		if _, err := provider.Embed(ctx, []string{"ping"}); err != nil {
+			return fmt.Errorf("embedding test failed: %w", err)
+		}
+		out, err := json.Marshal(map[string]interface{}{
+			"success":    true,
+			"provider":   project.Embedding.Provider,
+			"model":      project.Embedding.Model,
+			"dimensions": provider.Dimensions(),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to marshal result: %w", err)
+		}
+		fmt.Println(string(out))
+
+	case "blurb-llm":
+		// Resolve the blurb LLM via the same path discovery uses; falls
+		// back to the analysis LLM credential when blurb borrows that
+		// provider's setup.
+		providerName, model, credential, err := resolveBlurbLLM(ctx, cfg, project, secretProvider, projectID)
+		if err != nil {
+			return err
+		}
+		testCfg := *cfg
+		testCfg.LLM.MaxRetries = 1
+		testCfg.LLM.RequestDelayMs = 0
+		// Mirror the strict guard in index_schema.go::runIndexSchema —
+		// a non-nil BlurbLLM with an empty Provider field means the
+		// document only carries override config (e.g. legacy/partial
+		// documents) but resolveBlurbLLM has fallen back to the analysis
+		// provider. Without checking Provider too, this branch would
+		// feed the (likely empty) BlurbLLM.Config into the factory
+		// while the resolved provider+model come from project.LLM,
+		// diverging from what the agent does at indexing time.
+		extra := map[string]string{}
+		if project.BlurbLLM != nil && project.BlurbLLM.Provider != "" {
+			for k, v := range project.BlurbLLM.Config {
+				extra[k] = v
+			}
+		} else {
+			for k, v := range project.LLM.Config {
+				extra[k] = v
+			}
+		}
+		llmCfg := buildLLMProviderConfig(&testCfg, extra, credential, model)
+		provider, err := gollm.NewProvider(providerName, llmCfg)
+		if err != nil {
+			return fmt.Errorf("failed to create blurb LLM provider (%s): %w", providerName, err)
+		}
+		if err := provider.Validate(ctx); err != nil {
+			return err
+		}
+		out, err := json.Marshal(map[string]interface{}{
+			"success":  true,
+			"provider": providerName,
+			"model":    model,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to marshal result: %w", err)
+		}
+		fmt.Println(string(out))
 	}
 
 	return nil

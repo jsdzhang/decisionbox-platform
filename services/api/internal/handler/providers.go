@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"sort"
 	"time"
@@ -153,11 +155,28 @@ func displayOr(a, b string) string {
 	return b
 }
 
+// projectLiveModelsRequest is the body of POST
+// /api/v1/projects/{id}/providers/llm/models/live. The optional Slot field
+// picks which project slot to read — "llm" (default) for the analysis LLM,
+// "blurb_llm" for the schema-index blurb LLM. The slot determines both the
+// project field (project.LLM vs project.BlurbLLM) and the secret key
+// (llm-credentials vs blurb-llm-credentials).
+//
+// When slot=blurb_llm but the project has no blurb_llm configured, the
+// handler falls back to the analysis LLM slot (matching the agent's
+// resolveBlurbLLM behaviour — a missing blurb_llm means "reuse analysis").
+type projectLiveModelsRequest struct {
+	Slot string `json:"slot,omitempty"`
+}
+
 // ListLiveLLMModelsForProject runs the same merge as ListLiveLLMModels
 // but pulls the API key from the project's saved secret (if any) so
 // the user doesn't re-enter it on the settings screen. Cloud providers
 // that use ambient credentials (Bedrock, Vertex) work here too — the
 // factory picks up IAM / ADC from the environment.
+//
+// The request body may include {"slot": "blurb_llm"} to read the
+// project's blurb-LLM slot instead of the default analysis-LLM slot.
 //
 // Requires a handler built via NewProvidersHandlerWithProject — the
 // plain NewProvidersHandler() does not wire the project repo and
@@ -171,6 +190,29 @@ func (h *ProvidersHandler) ListLiveLLMModelsForProject(w http.ResponseWriter, r 
 		return
 	}
 
+	// Body is optional — an empty body is the legacy {slot: "llm"} call.
+	var body projectLiveModelsRequest
+	if r.ContentLength > 0 {
+		// Tolerate an empty `{}` body too: io.EOF from Decode is the
+		// idiomatic empty-body signal. Use errors.Is rather than a
+		// string compare against "EOF" so any future error wrapping
+		// (or a different decoder error type that happens to stringify
+		// to "EOF") still routes correctly. Real malformed JSON falls
+		// through to the 400 below.
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+	}
+	slot := body.Slot
+	if slot == "" {
+		slot = "llm"
+	}
+	if slot != "llm" && slot != "blurb_llm" {
+		writeError(w, http.StatusBadRequest, "invalid slot: "+slot+" (must be llm or blurb_llm)")
+		return
+	}
+
 	project, err := h.projectRepo.GetByID(r.Context(), pid)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load project: "+err.Error())
@@ -180,31 +222,75 @@ func (h *ProvidersHandler) ListLiveLLMModelsForProject(w http.ResponseWriter, r 
 		writeError(w, http.StatusNotFound, "project not found")
 		return
 	}
-	if project.LLM.Provider == "" {
-		writeError(w, http.StatusBadRequest, "project has no llm provider configured")
+
+	// Resolve the slot to a (provider, model, config, []secretKey) tuple.
+	// For slot=blurb_llm the secret lookup order matches the agent's
+	// resolveBlurbLLM (index_schema.go): blurb-llm-credentials first,
+	// then fall back to llm-credentials. This applies whether or not
+	// project.BlurbLLM is populated — a user can configure a blurb-
+	// specific credential even when blurb shares the analysis provider,
+	// and the dashboard's "Load models" must read the same credential
+	// the agent would read at indexing time.
+	var (
+		provider   string
+		modelID    string
+		slotCfg    map[string]string
+		secretKeys []string
+	)
+	switch slot {
+	case "blurb_llm":
+		if project.BlurbLLM != nil && project.BlurbLLM.Provider != "" {
+			provider = project.BlurbLLM.Provider
+			modelID = project.BlurbLLM.Model
+			slotCfg = project.BlurbLLM.Config
+		} else {
+			// No blurb override — borrow the analysis LLM's provider/
+			// model/config but still prefer the blurb-specific secret
+			// per the agent's resolveBlurbLLM contract.
+			provider = project.LLM.Provider
+			modelID = project.LLM.Model
+			slotCfg = project.LLM.Config
+		}
+		secretKeys = []string{"blurb-llm-credentials", "llm-credentials"}
+	default:
+		provider = project.LLM.Provider
+		modelID = project.LLM.Model
+		slotCfg = project.LLM.Config
+		secretKeys = []string{"llm-credentials"}
+	}
+
+	if provider == "" {
+		writeError(w, http.StatusBadRequest, "project has no "+slot+" provider configured")
 		return
 	}
 
-	meta, ok := gollm.GetProviderMeta(project.LLM.Provider)
+	meta, ok := gollm.GetProviderMeta(provider)
 	if !ok {
-		writeError(w, http.StatusNotFound, "unknown provider on project: "+project.LLM.Provider)
+		writeError(w, http.StatusNotFound, "unknown provider on project: "+provider)
 		return
 	}
 
-	// Build config from project.llm.config + the stored secret.
+	// Build config from the slot's config + the stored secret.
 	// For the *list* call we only need credentials + connection params;
 	// fetchLiveModels fills in a placeholder model for factories that
 	// require one at construction time.
 	cfg := map[string]string{}
-	for k, v := range project.LLM.Config {
+	for k, v := range slotCfg {
 		cfg[k] = v
 	}
-	if project.LLM.Model != "" {
-		cfg["model"] = project.LLM.Model
+	if modelID != "" {
+		cfg["model"] = modelID
 	}
 	if h.secretProvider != nil {
-		if key, err := h.secretProvider.Get(r.Context(), pid, "llm-api-key"); err == nil && key != "" {
-			cfg["api_key"] = key
+		// First non-empty secret wins, mirroring the agent's lookup
+		// order (blurb-specific takes precedence even when blurb
+		// borrows the analysis provider's config).
+		for _, key := range secretKeys {
+			value, err := h.secretProvider.Get(r.Context(), pid, key)
+			if err == nil && value != "" {
+				cfg["credentials_json"] = value
+				break
+			}
 		}
 	}
 	// cfg holds the secret for the duration of this handler; it goes
@@ -214,7 +300,7 @@ func (h *ProvidersHandler) ListLiveLLMModelsForProject(w http.ResponseWriter, r 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	live, liveErr := fetchLiveModels(ctx, project.LLM.Provider, cfg)
+	live, liveErr := fetchLiveModels(ctx, provider, cfg)
 	writeLiveModelsResponse(w, meta, live, liveErr)
 }
 
@@ -262,10 +348,14 @@ func writeLiveModelsResponse(w http.ResponseWriter, meta gollm.ProviderMeta, liv
 	}
 	for _, lm := range live {
 		// If the live ID matches an alias, project onto the canonical
-		// row so we don't double-list the same model.
+		// row so we don't double-list the same model. Suppressed for
+		// providers (Ollama) where the canonical ID is NOT dispatchable
+		// — the user must save the exact live ID the upstream returns.
 		canonical := lm.ID
-		if c, ok := canonicalByID[lm.ID]; ok {
-			canonical = c
+		if !meta.PreferLiveModelID {
+			if c, ok := canonicalByID[lm.ID]; ok {
+				canonical = c
+			}
 		}
 		row, ok := merged[canonical]
 		if ok {
@@ -282,9 +372,14 @@ func writeLiveModelsResponse(w http.ResponseWriter, meta gollm.ProviderMeta, liv
 			if meta.FamilyInferrer != nil {
 				inferred = string(meta.FamilyInferrer(lm.ID))
 			}
+			// Wire-blind providers (Ollama today) dispatch every model
+			// ID through one SDK path with no wire switch, so live
+			// rows are always dispatchable regardless of inference.
+			dispatchable := meta.DispatchAnyModelID ||
+				(inferred != "" && inferred != string(gollm.WireUnknown))
 			merged[lm.ID] = liveModelsResponse{
 				Source:       "live",
-				Dispatchable: inferred != "" && inferred != string(gollm.WireUnknown),
+				Dispatchable: dispatchable,
 				ModelInfo: gollm.ModelInfo{
 					ID:          lm.ID,
 					DisplayName: displayOr(lm.DisplayName, lm.ID),
@@ -391,12 +486,18 @@ func (h *ProvidersHandler) ListLiveEmbeddingModelsForProject(w http.ResponseWrit
 	}
 
 	cfg := map[string]string{}
-	// Pull the stored key so the live call has credentials without the
-	// user re-typing. Match the agent's lookup so project-scoped list
-	// works exactly like a real indexing run's embed call.
+	// Forward the project's saved non-credential settings (auth_method,
+	// region, project_id, location, role_arn, …) so the live-list
+	// instantiation mirrors what the agent does at indexing time.
+	for k, v := range project.Embedding.Config {
+		cfg[k] = v
+	}
+	// Pull the stored credential so the live call has credentials
+	// without the user re-typing. Match the agent's lookup so
+	// project-scoped list works exactly like a real indexing run.
 	if h.secretProvider != nil {
-		if key, err := h.secretProvider.Get(r.Context(), pid, "embedding-api-key"); err == nil && key != "" {
-			cfg["api_key"] = key
+		if key, err := h.secretProvider.Get(r.Context(), pid, "embedding-credentials"); err == nil && key != "" {
+			cfg["credentials_json"] = key
 		}
 	}
 

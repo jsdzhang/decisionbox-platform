@@ -351,6 +351,8 @@ export interface SchemaIndexLogLine {
 export interface EmbeddingConfig {
   provider: string;
   model: string;
+  /** Per-provider non-credential settings (auth_method, role_arn, …). */
+  config?: Record<string, string>;
 }
 
 export interface WarehouseConfig {
@@ -717,6 +719,7 @@ export interface EmbeddingProviderMeta {
   name: string;
   description: string;
   config_fields: ConfigField[];
+  auth_methods?: AuthMethod[];
   models: EmbeddingModelMeta[];
 }
 
@@ -926,10 +929,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ config }),
     }),
-  listLiveLLMModelsForProject: (projectID: string) =>
+  // slot defaults to "llm" on the server. Pass "blurb_llm" to read the
+  // project's blurb-LLM slot (project.blurb_llm + blurb-llm-credentials),
+  // which falls back to the analysis-LLM slot when no blurb override is
+  // configured (matching the agent's resolveBlurbLLM behaviour).
+  listLiveLLMModelsForProject: (projectID: string, slot?: 'llm' | 'blurb_llm') =>
     request<LiveModelsResponse>(`/api/v1/projects/${encodeURIComponent(projectID)}/providers/llm/models/live`, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify(slot ? { slot } : {}),
     }),
   listWarehouseProviders: () => request<ProviderMeta[]>('/api/v1/providers/warehouse'),
 
@@ -1138,6 +1145,10 @@ export const api = {
     request<TestConnectionResult>(`/api/v1/projects/${projectId}/test/warehouse`, { method: 'POST' }),
   testLLM: (projectId: string) =>
     request<TestConnectionResult>(`/api/v1/projects/${projectId}/test/llm`, { method: 'POST' }),
+  testEmbedding: (projectId: string) =>
+    request<TestConnectionResult>(`/api/v1/projects/${projectId}/test/embedding`, { method: 'POST' }),
+  testBlurbLLM: (projectId: string) =>
+    request<TestConnectionResult>(`/api/v1/projects/${projectId}/test/blurb-llm`, { method: 'POST' }),
 
   // Embedding providers
   listEmbeddingProviders: () => request<EmbeddingProviderMeta[]>('/api/v1/providers/embedding'),

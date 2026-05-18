@@ -235,7 +235,7 @@ func (g *Generator) Generate(ctx context.Context, inputs []Input, progress Progr
 			close(jobs)
 			wg.Wait()
 			if failures > maxFailures {
-				return outputs, fmt.Errorf("blurb: %w (%d of %d failed, cap %d)", ErrTooManyFailures, failures, len(inputs), maxFailures)
+				return outputs, fmt.Errorf("blurb: %w (%d of %d failed, cap %d, sample error: %v)", ErrTooManyFailures, failures, len(inputs), maxFailures, firstError(outputs))
 			}
 			return outputs, ctx.Err()
 		case jobs <- job{idx: i, in: in}:
@@ -245,9 +245,33 @@ func (g *Generator) Generate(ctx context.Context, inputs []Input, progress Progr
 	wg.Wait()
 
 	if failures > maxFailures {
-		return outputs, fmt.Errorf("blurb: %w (%d of %d failed, cap %d)", ErrTooManyFailures, failures, len(inputs), maxFailures)
+		return outputs, fmt.Errorf("blurb: %w (%d of %d failed, cap %d, sample error: %v)", ErrTooManyFailures, failures, len(inputs), maxFailures, firstError(outputs))
 	}
 	return outputs, nil
+}
+
+// firstError returns the first non-nil per-table Err from outputs so
+// the failure-budget wrapper carries a real underlying message
+// instead of swallowing every per-table reason.
+//
+// Prefer errors that are NOT just propagated context cancellation —
+// when the failure cap trips, the worker pool calls cancel() and
+// every still-in-flight call returns "context canceled". Those are
+// downstream of the real failure, not the cause; iterating once for
+// a non-cancellation error first and falling back to whatever is
+// there surfaces the upstream issue (auth/permissions/throttling/…).
+func firstError(outputs []Output) error {
+	for _, o := range outputs {
+		if o.Err != nil && !errors.Is(o.Err, context.Canceled) && !strings.Contains(o.Err.Error(), "context canceled") {
+			return o.Err
+		}
+	}
+	for _, o := range outputs {
+		if o.Err != nil {
+			return o.Err
+		}
+	}
+	return nil
 }
 
 // ErrTooManyFailures is returned from Generate when the fraction of per-
@@ -430,6 +454,11 @@ var reasoningClassPatterns = []string{
 	"o1-",
 	"o3",
 	"o4-mini",
+	// GPT-5 family — reasoning by default. Burns max_completion_tokens
+	// on hidden reasoning before producing visible content, so a 512-token
+	// blurb budget yields content="". Matches "gpt-5", "gpt-5-mini",
+	// "gpt-5-nano", and dated snapshots (gpt-5-2025-08-07).
+	"gpt-5",
 	"extended-thinking",
 }
 

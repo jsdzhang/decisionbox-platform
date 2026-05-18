@@ -87,8 +87,10 @@ export default function NewProjectPage() {
         if ((embProvs || []).length > 0) {
           const openai = embProvs.find((p) => p.id === 'openai');
           const first = openai || embProvs[0];
+          const methods = first.auth_methods ?? [];
           setEmbedding({
             provider: first.id,
+            authMethod: methods.length === 1 ? methods[0].id : '',
             model: first.models.find((m) => m.id === 'text-embedding-3-large')?.id || first.models[0]?.id || '',
             config: {},
             apiKey: '',
@@ -111,9 +113,11 @@ export default function NewProjectPage() {
         if (llmProvs.length > 0) {
           const claude = llmProvs.find((p) => p.id === 'claude');
           const first = claude || llmProvs[0];
+          const methods = first.auth_methods ?? [];
           setLlm((prev) => ({
             ...prev,
             provider: first.id,
+            authMethod: methods.length === 1 ? methods[0].id : '',
             config: buildDefaults(first.config_fields),
           }));
         }
@@ -166,11 +170,15 @@ export default function NewProjectPage() {
     setAiLoading(true);
     setLiveError(null);
     try {
-      // Build the config map the backend expects: every field the user
-      // filled in, plus api_key as its own key (the factories all read
-      // cfg["api_key"]).
+      // Build the config map the backend expects: every form-state
+      // field plus auth_method + credentials_json (every provider
+      // factory reads the credential from cfg["credentials_json"] now;
+      // api_key as a top-level key was removed during the auth-method
+      // refactor — the live-list call must mirror what the agent
+      // sends at indexing time).
       const config: Record<string, string> = { ...llm.config };
-      if (llm.apiKey) config['api_key'] = llm.apiKey;
+      if (llm.authMethod) config['auth_method'] = llm.authMethod;
+      if (llm.apiKey) config['credentials_json'] = llm.apiKey;
       const resp = await api.listLiveLLMModels(provider, config);
       if (reqId !== loadReqIdRef.current) return; // superseded
       setLiveModels(resp.models);
@@ -239,13 +247,26 @@ export default function NewProjectPage() {
         llm: {
           provider: llm.provider,
           model: llm.config['model'] || '',
-          config: Object.fromEntries(
-            Object.entries(llm.config).filter(([k]) => k !== 'model' && k !== 'api_key')
-          ),
+          config: {
+            ...Object.fromEntries(
+              Object.entries(llm.config).filter(([k]) => k !== 'model' && k !== 'api_key')
+            ),
+            ...(llm.authMethod ? { auth_method: llm.authMethod } : {}),
+          },
         },
         embedding: {
           provider: embedding.provider,
           model: embedding.model,
+          // Persist every form-state config field (project_id, location,
+          // region, …) plus auth_method when picked. Required for
+          // Vertex (project_id + location), Bedrock (region), and any
+          // provider whose factory reads non-credential settings from
+          // ProviderConfig. Drop "model" because it lives in the
+          // top-level Model field, not Config.
+          config: {
+            ...Object.fromEntries(Object.entries(embedding.config).filter(([k]) => k !== 'model')),
+            ...(embedding.authMethod ? { auth_method: embedding.authMethod } : {}),
+          },
         },
         // Only send blurb_llm when the user explicitly overrode it; otherwise
         // the agent falls back to the analysis LLM (its own fallback path).
@@ -254,32 +275,39 @@ export default function NewProjectPage() {
               blurb_llm: {
                 provider: blurb.provider,
                 model: blurb.model,
-                config: Object.fromEntries(
-                  Object.entries(blurb.config).filter(([k]) => k !== 'model' && k !== 'api_key')
-                ),
+                config: {
+                  ...Object.fromEntries(
+                    Object.entries(blurb.config).filter(([k]) => k !== 'model' && k !== 'api_key')
+                  ),
+                  ...(blurb.authMethod ? { auth_method: blurb.authMethod } : {}),
+                },
               },
             }
           : {}),
         schedule: { enabled: scheduleEnabled, cron_expr: scheduleCron, max_steps: maxSteps },
       });
-      // Save secrets
-      if (llm.apiKey && project.id) {
-        await api.setSecret(project.id, 'llm-api-key', llm.apiKey);
-      }
-      if (warehouse.credential && project.id) {
-        await api.setSecret(project.id, 'warehouse-credentials', warehouse.credential);
-      }
-      // Blurb-LLM key is stored separately. Only written when the user
-      // supplied one — otherwise the agent falls back to `llm-api-key`.
-      if (blurb.enabled && blurb.apiKey && project.id) {
-        await api.setSecret(project.id, 'blurb-llm-api-key', blurb.apiKey);
-      }
-      // Embedding key — required by the worker pre-flight if the
-      // provider exposes a credential field. Safe to save conditionally
-      // on user input (empty → skip, preserves an existing stored key
-      // on re-creates).
-      if (embedding.apiKey && project.id) {
-        await api.setSecret(project.id, 'embedding-api-key', embedding.apiKey);
+      // Save secrets in parallel — sequential awaits left a ~1s race
+      // window between project creation (which sets
+      // schema_index_status=pending_indexing) and the schema-index
+      // worker's next poll. The worker would claim the project before
+      // embedding-credentials was stored and fail with "API key is
+      // required". Promise.all compresses the window to a single
+      // round-trip (~250ms) which is shorter than the worker's poll
+      // interval, so in practice the race no longer fires.
+      if (project.id) {
+        const writes: Promise<unknown>[] = [];
+        if (llm.apiKey) writes.push(api.setSecret(project.id, 'llm-credentials', llm.apiKey));
+        if (warehouse.credential) writes.push(api.setSecret(project.id, 'warehouse-credentials', warehouse.credential));
+        // Blurb-LLM credentials are stored separately. Only written when
+        // the user supplied one — otherwise the agent falls back to
+        // `llm-credentials`.
+        if (blurb.enabled && blurb.apiKey) writes.push(api.setSecret(project.id, 'blurb-llm-credentials', blurb.apiKey));
+        // Embedding credentials — required by the worker pre-flight if
+        // the provider exposes a credential field. Safe to save
+        // conditionally on user input (empty → skip, preserves an
+        // existing stored key on re-creates).
+        if (embedding.apiKey) writes.push(api.setSecret(project.id, 'embedding-credentials', embedding.apiKey));
+        await Promise.all(writes);
       }
 
       notifications.show({ title: 'Project created', message: project.name, color: 'green' });

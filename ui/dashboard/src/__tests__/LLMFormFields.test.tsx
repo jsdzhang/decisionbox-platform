@@ -26,9 +26,18 @@ const openaiMeta: ProviderMeta = {
   name: 'OpenAI',
   description: 'OpenAI models',
   config_fields: [
-    { key: 'api_key', label: 'API Key', required: true, type: 'credential', placeholder: 'sk-…', description: '', default: '', options: [] },
     { key: 'base_url', label: 'Base URL', required: false, type: 'string', placeholder: '', description: '', default: 'https://api.openai.com/v1', options: [] },
     { key: 'model', label: 'Model', required: true, type: 'string', placeholder: '', description: '', default: '', options: [] },
+  ],
+  auth_methods: [
+    {
+      id: 'api_key',
+      name: 'API Key',
+      description: 'OpenAI API key.',
+      fields: [
+        { key: 'credentials_json', label: 'API Key', required: true, type: 'credential', placeholder: 'sk-…', description: '', default: '', options: [] },
+      ],
+    },
   ],
 };
 
@@ -39,6 +48,22 @@ const bedrockMeta: ProviderMeta = {
   config_fields: [
     { key: 'region', label: 'Region', required: true, type: 'string', placeholder: '', description: '', default: 'us-east-1', options: [] },
     { key: 'model', label: 'Model', required: true, type: 'string', placeholder: '', description: '', default: '', options: [] },
+  ],
+  auth_methods: [
+    {
+      id: 'iam_role',
+      name: 'IAM Role',
+      description: 'Ambient AWS credentials.',
+      fields: [],
+    },
+    {
+      id: 'access_keys',
+      name: 'Access Keys',
+      description: 'AWS access key pair.',
+      fields: [
+        { key: 'credentials_json', label: 'Access Keys', required: true, type: 'credential', placeholder: 'AKIA…:wJalr…', description: '', default: '', options: [] },
+      ],
+    },
   ],
 };
 
@@ -95,30 +120,33 @@ describe('LLMFormFields — credentials phase', () => {
   test('OpenAI: renders API Key field (required) and Load models button', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: { base_url: 'https://api.openai.com/v1' },
       apiKey: '',
     };
     const { container } = render(<ControlledHarness providers={[openaiMeta]} initial={initial} />);
-    // API Key is a password input — find it directly to avoid Mantine's
+    // API Key is a textarea (clear text, matches warehouse credential UX) — find it directly to avoid Mantine's
     // label-association quirks with the required asterisk.
-    expect(container.querySelector('input[type="password"]')).toBeInTheDocument();
+    expect(container.querySelector('textarea')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Load models' })).toBeInTheDocument();
   });
 
   test('Bedrock: renders cloud-credentials hint instead of API Key', () => {
     const initial: LLMFormState = {
       provider: 'bedrock',
+      authMethod: 'iam_role',
       config: { region: 'us-east-1' },
       apiKey: '',
     };
     render(<ControlledHarness providers={[bedrockMeta]} initial={initial} />);
     expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument();
-    expect(screen.getByText(/uses cloud credentials/i)).toBeInTheDocument();
+    expect(screen.getByText(/ambient cloud credentials/i)).toBeInTheDocument();
   });
 
   test('Load models is disabled when api_key is missing on a credential provider', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: '',
     };
@@ -129,6 +157,7 @@ describe('LLMFormFields — credentials phase', () => {
   test('Load models is enabled once api_key is filled', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: 'sk-test',
     };
@@ -139,6 +168,7 @@ describe('LLMFormFields — credentials phase', () => {
   test('Load models is enabled for cloud-creds providers without api_key', () => {
     const initial: LLMFormState = {
       provider: 'bedrock',
+      authMethod: 'iam_role',
       config: { region: 'us-east-1' },
       apiKey: '',
     };
@@ -146,14 +176,15 @@ describe('LLMFormFields — credentials phase', () => {
     expect(screen.getByRole('button', { name: 'Load models' })).not.toBeDisabled();
   });
 
-  test('hasSavedApiKey label switches to "Update API Key" and Load models is enabled with no fresh key', () => {
+  test('hasSavedApiKey label switches to "Update credentials" and Load models is enabled with no fresh key', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: '',
     };
     render(<ControlledHarness providers={[openaiMeta]} initial={initial} hasSavedApiKey />);
-    expect(screen.getByLabelText('Update API Key')).toBeInTheDocument();
+    expect(screen.getByLabelText('Update credentials')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Load models' })).not.toBeDisabled();
   });
 
@@ -161,6 +192,7 @@ describe('LLMFormFields — credentials phase', () => {
     const onLoadModels = jest.fn().mockResolvedValue(undefined);
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: 'sk-test',
     };
@@ -172,11 +204,12 @@ describe('LLMFormFields — credentials phase', () => {
   test('typing into the API Key field updates state', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: '',
     };
     const { container } = render(<ControlledHarness providers={[openaiMeta]} initial={initial} />);
-    const passwordInput = container.querySelector('input[type="password"]') as HTMLInputElement;
+    const passwordInput = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(passwordInput).not.toBeNull();
     fireEvent.change(passwordInput, { target: { value: 'sk-typed' } });
     expect(getDump().value.apiKey).toBe('sk-typed');
@@ -187,6 +220,7 @@ describe('LLMFormFields — model phase', () => {
   test('renders LiveModelCombobox in model phase', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: 'sk-test',
     };
@@ -199,6 +233,7 @@ describe('LLMFormFields — model phase', () => {
   test('shows live-error alert when liveError is supplied', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: 'sk-test',
     };
@@ -217,6 +252,7 @@ describe('LLMFormFields — model phase', () => {
   test('Back to credentials returns to credentials phase', () => {
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: 'sk-test',
     };
@@ -229,6 +265,7 @@ describe('LLMFormFields — model phase', () => {
     const onLoadModels = jest.fn().mockResolvedValue(undefined);
     const initial: LLMFormState = {
       provider: 'openai',
+      authMethod: 'api_key',
       config: {},
       apiKey: 'sk-test',
     };
@@ -274,6 +311,7 @@ describe('LLMFormFields — model phase wire_override disclosure', () => {
   test('renders wire_override inline when the selected model has no known wire', () => {
     const initial: LLMFormState = {
       provider: 'wire-aware',
+      authMethod: 'api_key',
       config: { model: 'unknown-typed-model' },
       apiKey: 'sk-test',
     };
@@ -287,6 +325,7 @@ describe('LLMFormFields — model phase wire_override disclosure', () => {
     const user = userEvent.setup();
     const initial: LLMFormState = {
       provider: 'wire-aware',
+      authMethod: 'api_key',
       config: { model: 'known-model' },
       apiKey: 'sk-test',
     };
@@ -311,6 +350,7 @@ describe('LLMFormFields — model phase wire_override disclosure', () => {
   test('typing into the model combobox updates state via setConfigField', () => {
     const initial: LLMFormState = {
       provider: 'wire-aware',
+      authMethod: 'api_key',
       config: { model: '' },
       apiKey: 'sk-test',
     };
@@ -319,7 +359,7 @@ describe('LLMFormFields — model phase wire_override disclosure', () => {
     // The Model field is rendered by LiveModelCombobox; in jsdom
     // Mantine's Autocomplete renders an <input> with the field label.
     const modelInputs = screen.getAllByLabelText(/Model/);
-    const input = modelInputs.find((el) => el.tagName === 'INPUT') as HTMLInputElement | undefined;
+    const input = modelInputs.find((el) => el.tagName === 'INPUT') as HTMLTextAreaElement | undefined;
     expect(input).toBeDefined();
     if (!input) return;
     fireEvent.change(input, { target: { value: 'typed-model' } });
@@ -332,11 +372,12 @@ describe('LLMFormFields — model phase wire_override disclosure', () => {
     // rendered without going through the Advanced disclosure.
     const initial: LLMFormState = {
       provider: 'wire-aware',
+      authMethod: 'api_key',
       config: { model: 'unknown-model', wire_override: '' },
       apiKey: 'sk-test',
     };
     render(<ControlledHarness providers={[wireOnlyMeta]} initial={initial} initialPhase="model" />);
-    const wireInput = screen.getByLabelText(/Wire override/) as HTMLInputElement;
+    const wireInput = screen.getByLabelText(/Wire override/) as HTMLTextAreaElement;
     fireEvent.change(wireInput, { target: { value: 'anthropic-messages' } });
     expect(getDump().value.config.wire_override).toBe('anthropic-messages');
   });
@@ -350,12 +391,102 @@ describe('LLMFormFields — Bedrock interaction', () => {
   test('setting region via the rendered TextInput updates state.config', () => {
     const initial: LLMFormState = {
       provider: 'bedrock',
+      authMethod: 'iam_role',
       config: { region: 'us-east-1' },
       apiKey: '',
     };
     const { container } = render(<ControlledHarness providers={[bedrockMeta]} initial={initial} />);
-    const regionInput = within(container).getByLabelText(/Region/) as HTMLInputElement;
+    const regionInput = within(container).getByLabelText(/Region/) as HTMLTextAreaElement;
     fireEvent.change(regionInput, { target: { value: 'eu-west-1' } });
     expect(getDump().value.config.region).toBe('eu-west-1');
+  });
+
+  // Bedrock declares iam_role + access_keys auth methods (per the
+  // fixture), so the auth-method selector renders. These tests pin the
+  // multi-method UI paths LLMFormFields takes for cloud providers.
+  test('shows auth-method selector when provider has 2+ methods', () => {
+    const initial: LLMFormState = {
+      provider: 'bedrock',
+      authMethod: 'iam_role',
+      config: { region: 'us-east-1' },
+      apiKey: '',
+    };
+    render(<ControlledHarness providers={[bedrockMeta]} initial={initial} />);
+    expect(screen.getAllByLabelText(/Authentication method/i).length).toBeGreaterThan(0);
+  });
+
+  test('switching to access_keys reveals the credential field + clears any prior apiKey', () => {
+    const initial: LLMFormState = {
+      provider: 'bedrock',
+      authMethod: 'access_keys',
+      config: { region: 'us-east-1' },
+      apiKey: '',
+    };
+    const { container } = render(<ControlledHarness providers={[bedrockMeta]} initial={initial} />);
+    // The credential field's label comes from the auth-method fixture
+    // ("Access Keys"). bedrockMeta defines a single credential field
+    // with that label.
+    expect(within(container).getByLabelText(/Access Keys/i)).toBeInTheDocument();
+  });
+
+  test('Load models is disabled until an auth_method is picked on a multi-method provider', () => {
+    const initial: LLMFormState = {
+      provider: 'bedrock',
+      authMethod: '',
+      config: { region: 'us-east-1' },
+      apiKey: '',
+    };
+    render(<ControlledHarness providers={[bedrockMeta]} initial={initial} />);
+    expect(screen.getByRole('button', { name: 'Load models' })).toBeDisabled();
+  });
+
+  test('Load models is enabled for iam_role (ambient creds, no credential field)', () => {
+    const initial: LLMFormState = {
+      provider: 'bedrock',
+      authMethod: 'iam_role',
+      config: { region: 'us-east-1' },
+      apiKey: '',
+    };
+    render(<ControlledHarness providers={[bedrockMeta]} initial={initial} />);
+    expect(screen.getByRole('button', { name: 'Load models' })).not.toBeDisabled();
+  });
+
+  // Regression: when the parent pre-selects a provider but forgets to
+  // pre-select its auth method (e.g. new-project page defaulting to
+  // Claude), the credential field must NOT silently disappear — the
+  // user would see "Claude selected" but no API key input. Reported by
+  // user testing locally after PR #222 went up.
+  test('single-method provider pre-selected without authMethod still renders nothing — caller must pre-select method', () => {
+    const initial: LLMFormState = {
+      provider: 'openai',
+      authMethod: '', // parent forgot to set it — bug repro
+      config: {},
+      apiKey: '',
+    };
+    render(<ControlledHarness providers={[openaiMeta]} initial={initial} />);
+    // Credential field is gated on selectedMethod (= authMethods.find by
+    // value.authMethod). With authMethod='' no method is selected →
+    // no credential field renders. This is the failure mode the user
+    // hit. Documenting the contract: callers MUST initialise
+    // authMethod when they initialise provider.
+    expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument();
+    // Load models should be disabled in this state so the user can't
+    // submit a broken config silently.
+    expect(screen.getByRole('button', { name: 'Load models' })).toBeDisabled();
+  });
+
+  test('single-method provider pre-selected WITH authMethod renders the credential field', () => {
+    // Fixed state: parent supplies provider + authMethod together —
+    // credential field renders, button enables when filled. This is
+    // the contract the new-project page + ProvidersPanel hydration
+    // paths must satisfy.
+    const initial: LLMFormState = {
+      provider: 'openai',
+      authMethod: 'api_key',
+      config: {},
+      apiKey: '',
+    };
+    const { container } = render(<ControlledHarness providers={[openaiMeta]} initial={initial} />);
+    expect(container.querySelector('textarea')).toBeInTheDocument();
   });
 });

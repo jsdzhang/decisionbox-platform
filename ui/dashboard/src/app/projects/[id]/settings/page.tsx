@@ -112,9 +112,13 @@ export default function ProjectSettingsPage() {
         setMaxSteps(proj.schedule?.max_steps || 100);
         setProfile((proj.profile || {}) as Record<string, Record<string, unknown>>);
         if (proj.blurb_llm && proj.blurb_llm.provider) {
+          const blurbProviderID = proj.blurb_llm.provider;
+          const blurbMeta = llmProvs?.find((p) => p.id === blurbProviderID);
+          const blurbMethods = blurbMeta?.auth_methods ?? [];
           setBlurb({
             enabled: true,
-            provider: proj.blurb_llm.provider,
+            provider: blurbProviderID,
+            authMethod: blurbMethods.length === 1 ? blurbMethods[0].id : '',
             model: proj.blurb_llm.model || '',
             config: proj.blurb_llm.config || {},
             apiKey: '',
@@ -211,14 +215,17 @@ export default function ProjectSettingsPage() {
             ? {
                 provider: blurb.provider,
                 model: blurb.model,
-                config: Object.fromEntries(
-                  Object.entries(blurb.config).filter(([k]) => k !== 'model' && k !== 'api_key'),
-                ),
+                config: {
+                  ...Object.fromEntries(
+                    Object.entries(blurb.config).filter(([k]) => k !== 'model' && k !== 'api_key'),
+                  ),
+                  ...(blurb.authMethod ? { auth_method: blurb.authMethod } : {}),
+                },
               }
             : undefined,
       });
       if (blurb.enabled && blurb.apiKey) {
-        await api.setSecret(id, 'blurb-llm-api-key', blurb.apiKey);
+        await api.setSecret(id, 'blurb-llm-credentials', blurb.apiKey);
         setBlurb((prev) => ({ ...prev, apiKey: '' }));
       }
       setProject(saved);
@@ -290,6 +297,8 @@ export default function ProjectSettingsPage() {
               value={blurb}
               onChange={(next) => setBlurb(next)}
               startInModelPhase={!!project?.blurb_llm?.provider}
+              projectId={id}
+              savedProvider={project?.blurb_llm?.provider || project?.llm?.provider}
             />
             <Group justify="flex-end">
               <Button onClick={saveBlurb} loading={savingBlurb}>Save blurb model</Button>

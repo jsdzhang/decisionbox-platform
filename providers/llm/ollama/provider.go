@@ -61,6 +61,20 @@ func init() {
 		},
 		Models:                 buildOllamaCatalog(),
 		DefaultMaxOutputTokens: 16384,
+		// Ollama dispatches every model through one SDK path with no
+		// wire switch, so any model the server has pulled (returned by
+		// /api/tags) is dispatchable. Without this flag, live-only rows
+		// like "gemma4:31b" come back with Wire="" + Dispatchable=false
+		// and the dashboard hides them under the "unsupported wire"
+		// filter.
+		DispatchAnyModelID: true,
+		// Ollama strictly requires the EXACT model:tag the user pulled.
+		// `ollama run qwen3` when only `qwen3:32b` is local returns 404.
+		// So the picker must save the live ID (qwen3:32b), not the
+		// catalog canonical (qwen3). FindModel keeps working at runtime
+		// because the catalog row's aliases include the tagged forms,
+		// so max-tokens enrichment still resolves.
+		PreferLiveModelID: true,
 	})
 }
 

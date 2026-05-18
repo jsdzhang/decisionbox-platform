@@ -86,9 +86,13 @@ export default function PackGenWizardPage() {
         // Hydrate the blurb editor from any persisted blurb_llm so
         // returning to the wizard mid-setup picks up the prior choice.
         if (p.blurb_llm?.provider && p.blurb_llm?.model) {
+          const blurbProviderID = p.blurb_llm.provider;
+          const blurbMeta = llmProvs?.find((prov) => prov.id === blurbProviderID);
+          const blurbMethods = blurbMeta?.auth_methods ?? [];
           setBlurb({
             enabled: true,
-            provider: p.blurb_llm.provider,
+            provider: blurbProviderID,
+            authMethod: blurbMethods.length === 1 ? blurbMethods[0].id : '',
             model: p.blurb_llm.model,
             config: p.blurb_llm.config || {},
             apiKey: '',
@@ -164,9 +168,12 @@ export default function PackGenWizardPage() {
             blurb_llm: {
               provider: blurb.provider,
               model: blurb.model,
-              config: Object.fromEntries(
-                Object.entries(blurb.config || {}).filter(([k]) => k !== 'model' && k !== 'api_key'),
-              ),
+              config: {
+                ...Object.fromEntries(
+                  Object.entries(blurb.config || {}).filter(([k]) => k !== 'model' && k !== 'api_key'),
+                ),
+                ...(blurb.authMethod ? { auth_method: blurb.authMethod } : {}),
+              },
             },
           }
         // Explicit null in the wire payload would be ideal but the API
@@ -178,7 +185,7 @@ export default function PackGenWizardPage() {
         : {};
       const saved = await api.updateProject(project.id, payload);
       if (blurb.enabled && blurb.apiKey) {
-        await api.setSecret(project.id, 'blurb-llm-api-key', blurb.apiKey);
+        await api.setSecret(project.id, 'blurb-llm-credentials', blurb.apiKey);
         setBlurb((prev) => ({ ...prev, apiKey: '' }));
       }
       setProject(saved);
@@ -322,6 +329,8 @@ export default function PackGenWizardPage() {
                   llmProviders={llmProviders}
                   value={blurb}
                   onChange={setBlurb}
+                  projectId={id}
+                  savedProvider={project?.blurb_llm?.provider || project?.llm?.provider}
                 />
                 <Group justify="flex-end">
                   <Button onClick={handleSaveBlurb} loading={savingBlurb} disabled={!blurbValid}>

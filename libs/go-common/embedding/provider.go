@@ -5,18 +5,23 @@ import "context"
 // ProjectConfig holds per-project embedding configuration.
 // Stored in the project document in MongoDB.
 // Shared between API and Agent services.
+//
+// Credentials are NOT persisted in this struct — they live in the
+// secret provider under the "embedding-credentials" key. The agent
+// resolves them via the shared resolveCredential helper (dashboard
+// secret wins, env var EMBEDDING_API_KEY as fallback) and injects them
+// into the per-provider ProviderConfig as "credentials_json".
+//
+// Config carries provider-specific non-credential settings selected by
+// the user in the dashboard: "auth_method" (iam_role / access_keys /
+// assume_role / adc / sa_key), plus method-specific fields like
+// role_arn, external_id, region, project_id, location. The agent
+// copies this map verbatim into the per-provider ProviderConfig at
+// init time, alongside the credential blob.
 type ProjectConfig struct {
-	Provider string `bson:"provider,omitempty" json:"provider,omitempty"`
-	Model    string `bson:"model,omitempty" json:"model,omitempty"`
-
-	// Credentials is the BYOK API key the project owner supplied via
-	// the UI. Persisted so the shape is BYOK-ready end-to-end, but
-	// ignored by the factory at runtime when an EMBEDDING_PROVIDER_API_KEY
-	// env override is present (DecisionBox Cloud injects the override
-	// today — paid plans will opt into BYOK by flipping
-	// byok_embedding_enabled, at which point the override is withheld
-	// and this field wins).
-	Credentials string `bson:"credentials,omitempty" json:"credentials,omitempty"`
+	Provider string            `bson:"provider,omitempty" json:"provider,omitempty"`
+	Model    string            `bson:"model,omitempty" json:"model,omitempty"`
+	Config   map[string]string `bson:"config,omitempty" json:"config,omitempty"`
 }
 
 // RemoteModel is one row returned by a provider's live ListModels

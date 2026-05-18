@@ -96,7 +96,18 @@ func runIndexSchema(cfg *config.Config, projectID, runID string) error {
 		return fmt.Errorf("blurb model %q is reasoning-class and cannot be used — pick gpt-4.1-nano, claude-haiku-4-5, or qwen.qwen3-32b-v1:0", blurbModel)
 	}
 
-	llmCfg := buildLLMProviderConfig(cfg, project.LLM.Config, blurbAPIKey, blurbModel)
+	// Pick the right config source for the blurb provider — when blurb
+	// is configured separately, its own Config holds the auth_method +
+	// per-method fields. Falling through to project.LLM.Config here was
+	// the legacy behaviour that worked only by accident when blurb and
+	// analysis used the same provider (e.g. Gemini + Gemini); a mixed
+	// setup like Vertex analysis + Bedrock blurb fed GCP auth_method
+	// values into the AWS factory and tripped "unsupported auth method".
+	blurbConfig := project.LLM.Config
+	if project.BlurbLLM != nil && project.BlurbLLM.Provider != "" {
+		blurbConfig = project.BlurbLLM.Config
+	}
+	llmCfg := buildLLMProviderConfig(cfg, blurbConfig, blurbAPIKey, blurbModel)
 	llm, err := gollm.NewProvider(blurbProvider, llmCfg)
 	if err != nil {
 		return fmt.Errorf("build blurb LLM (%s): %w", blurbProvider, err)
@@ -200,15 +211,19 @@ func runIndexSchema(cfg *config.Config, projectID, runID string) error {
 	return nil
 }
 
-// resolveBlurbLLM picks the provider + model + API key for blurb
-// generation. Order of resolution:
-//  1. project.BlurbLLM (new field, Phase A1) if set.
-//  2. project.LLM (fallback — reuses the analysis provider's key).
+// resolveBlurbLLM picks the provider + model + credential for blurb
+// generation. Order of resolution for the credential:
+//  1. blurb-llm-credentials secret (project-scoped, blurb-specific).
+//  2. BLURB_LLM_API_KEY env (operator fallback).
+//  3. llm-credentials secret (when blurb provider matches analysis LLM).
+//  4. LLM_API_KEY env.
 //
-// The API key is pulled from secrets: "blurb-llm-api-key" first, then
-// falls back to "llm-api-key" if the blurb provider matches the
-// analysis provider (most common case).
-func resolveBlurbLLM(ctx context.Context, _ *config.Config, project *models.Project, secretProvider gosecrets.Provider, projectID string) (providerName, model, apiKey string, err error) {
+// The blurb-specific secret + env always take precedence; the analysis-
+// LLM fallback only fires when the blurb provider is empty or matches
+// the analysis provider — same intent as before, just with the env
+// layer interleaved so operators can configure blurb credentials at the
+// pod level.
+func resolveBlurbLLM(ctx context.Context, _ *config.Config, project *models.Project, secretProvider gosecrets.Provider, projectID string) (providerName, model, credential string, err error) {
 	providerName = project.LLM.Provider
 	model = project.LLM.Model
 	if project.BlurbLLM != nil && project.BlurbLLM.Provider != "" {
@@ -224,21 +239,21 @@ func resolveBlurbLLM(ctx context.Context, _ *config.Config, project *models.Proj
 		return "", "", "", fmt.Errorf("no model configured for blurb LLM")
 	}
 
-	// Try the blurb-specific secret first; fall back to the shared key.
-	if key, lookupErr := secretProvider.Get(ctx, projectID, "blurb-llm-api-key"); lookupErr == nil && key != "" {
-		apiKey = key
-	} else if key, lookupErr := secretProvider.Get(ctx, projectID, "llm-api-key"); lookupErr == nil && key != "" {
-		apiKey = key
+	// Try the blurb-specific credential first; fall back to the analysis
+	// LLM credential when blurb borrows the analysis provider's setup.
+	credential, _ = resolveCredential(ctx, secretProvider, projectID, "blurb-llm-credentials", "BLURB_LLM_API_KEY")
+	if credential == "" {
+		credential, _ = resolveCredential(ctx, secretProvider, projectID, "llm-credentials", "LLM_API_KEY")
 	}
-	return providerName, model, apiKey, nil
+	return providerName, model, credential, nil
 }
 
 // buildLLMProviderConfig mirrors what initLLMProvider does but with a
-// caller-supplied api_key + model so the shared wiring doesn't have to
-// know about the blurb LLM override.
-func buildLLMProviderConfig(cfg *config.Config, extraConfig map[string]string, apiKey, model string) gollm.ProviderConfig {
+// caller-supplied credential + model so the shared wiring doesn't have
+// to know about the blurb LLM override.
+func buildLLMProviderConfig(cfg *config.Config, extraConfig map[string]string, credential, model string) gollm.ProviderConfig {
 	out := gollm.ProviderConfig{
-		"api_key":          apiKey,
+		"credentials_json": credential,
 		"model":            model,
 		"max_retries":      strconv.Itoa(cfg.LLM.MaxRetries),
 		"timeout_seconds":  strconv.Itoa(int(cfg.LLM.Timeout.Seconds())),

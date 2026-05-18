@@ -27,8 +27,17 @@ const openaiMeta: ProviderLike = {
   name: 'OpenAI',
   description: 'Models from OpenAI',
   config_fields: [
-    { key: 'api_key', label: 'API Key', required: true, type: 'credential', placeholder: 'sk-…', description: '', default: '', options: [] },
     { key: 'base_url', label: 'Base URL', required: false, type: 'string', placeholder: '', description: '', default: 'https://api.openai.com/v1', options: [] },
+  ],
+  auth_methods: [
+    {
+      id: 'api_key',
+      name: 'API Key',
+      description: 'OpenAI API key.',
+      fields: [
+        { key: 'credentials_json', label: 'API Key', required: true, type: 'credential', placeholder: 'sk-…', description: '', default: '', options: [] },
+      ],
+    },
   ],
 };
 const bedrockMeta: ProviderLike = {
@@ -37,6 +46,14 @@ const bedrockMeta: ProviderLike = {
   description: 'Uses IAM credentials',
   config_fields: [
     { key: 'region', label: 'Region', required: true, type: 'string', placeholder: '', description: '', default: 'us-east-1', options: [] },
+  ],
+  auth_methods: [
+    {
+      id: 'iam_role',
+      name: 'IAM Role',
+      description: 'Ambient AWS credentials.',
+      fields: [],
+    },
   ],
 };
 
@@ -47,7 +64,7 @@ function Harness({ providers, onLoad, initial, modelChild }: {
   modelChild?: React.ReactNode;
 }) {
   const [value, setValue] = useState<CredentialsPhaseValue>(
-    initial ?? { provider: '', config: {}, apiKey: '' }
+    initial ?? { provider: '', authMethod: '', config: {}, apiKey: '' }
   );
   return (
     <MantineProvider>
@@ -81,7 +98,7 @@ describe('ProviderCredentialsPhase', () => {
       <Harness
         providers={[openaiMeta]}
         onLoad={onLoad}
-        initial={{ provider: 'openai', config: {}, apiKey: '' }}
+        initial={{ provider: 'openai', authMethod: 'api_key', config: {}, apiKey: '' }}
       />
     );
     await waitFor(() => expect(screen.getByLabelText('API Key')).toBeInTheDocument());
@@ -93,7 +110,7 @@ describe('ProviderCredentialsPhase', () => {
       <Harness
         providers={[bedrockMeta]}
         onLoad={onLoad}
-        initial={{ provider: 'bedrock', config: { region: 'us-east-1' }, apiKey: '' }}
+        initial={{ provider: 'bedrock', authMethod: 'iam_role', config: { region: 'us-east-1' }, apiKey: '' }}
       />
     );
     await waitFor(() =>
@@ -108,7 +125,7 @@ describe('ProviderCredentialsPhase', () => {
       <Harness
         providers={[openaiMeta]}
         onLoad={onLoad}
-        initial={{ provider: 'openai', config: {}, apiKey: '' }}
+        initial={{ provider: 'openai', authMethod: 'api_key', config: {}, apiKey: '' }}
       />
     );
     const btn = await screen.findByRole('button', { name: 'Load models' });
@@ -123,6 +140,7 @@ describe('ProviderCredentialsPhase', () => {
         onLoad={onLoad}
         initial={{
           provider: 'openai',
+          authMethod: 'api_key',
           config: { base_url: 'https://api.openai.com/v1' },
           apiKey: 'sk-test-123',
         }}
@@ -133,7 +151,7 @@ describe('ProviderCredentialsPhase', () => {
     fireEvent.click(btn);
     await waitFor(() => expect(onLoad).toHaveBeenCalledTimes(1));
     const cfg = onLoad.mock.calls[0][0];
-    expect(cfg.api_key).toBe('sk-test-123');
+    expect(cfg.credentials_json).toBe('sk-test-123');
     expect(cfg.base_url).toBe('https://api.openai.com/v1');
   });
 
@@ -143,7 +161,7 @@ describe('ProviderCredentialsPhase', () => {
       <Harness
         providers={[openaiMeta]}
         onLoad={onLoad}
-        initial={{ provider: 'openai', config: {}, apiKey: 'sk-x' }}
+        initial={{ provider: 'openai', authMethod: 'api_key', config: {}, apiKey: 'sk-x' }}
       />
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Load models' }));
@@ -159,7 +177,7 @@ describe('ProviderCredentialsPhase', () => {
       <Harness
         providers={[openaiMeta]}
         onLoad={onLoad}
-        initial={{ provider: 'openai', config: {}, apiKey: 'sk-x' }}
+        initial={{ provider: 'openai', authMethod: 'api_key', config: {}, apiKey: 'sk-x' }}
       />
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Load models' }));
@@ -176,11 +194,113 @@ describe('ProviderCredentialsPhase', () => {
       <Harness
         providers={[openaiMeta]}
         onLoad={onLoad}
-        initial={{ provider: 'openai', config: {}, apiKey: 'sk-x' }}
+        initial={{ provider: 'openai', authMethod: 'api_key', config: {}, apiKey: 'sk-x' }}
       />
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Load models' }));
     await waitFor(() => expect(screen.getByText(/network down/i)).toBeInTheDocument());
     expect(screen.getByText('MODEL-PICKER-CHILD')).toBeInTheDocument();
+  });
+
+  // Multi-method providers (Bedrock LLM, Vertex LLM, Bedrock embedding,
+  // Vertex embedding) render an "Authentication method" dropdown
+  // alongside the credentials phase. The fixture below mimics Bedrock's
+  // three-method shape (iam_role / access_keys / assume_role).
+  const bedrockMultiMeta: ProviderLike = {
+    id: 'bedrock-multi',
+    name: 'AWS Bedrock (multi-method)',
+    description: 'Three auth methods',
+    config_fields: [
+      { key: 'region', label: 'Region', required: true, type: 'string', placeholder: '', description: '', default: 'us-east-1', options: [] },
+    ],
+    auth_methods: [
+      { id: 'iam_role', name: 'IAM Role', description: 'Ambient AWS credentials.', fields: [] },
+      {
+        id: 'access_keys', name: 'Access Keys', description: 'AWS access key pair.', fields: [
+          { key: 'credentials_json', label: 'Access Keys', required: true, type: 'credential', placeholder: 'AKIA…:wJalr…', description: '', default: '', options: [] },
+        ],
+      },
+      {
+        id: 'assume_role', name: 'Assume Role', description: 'STS AssumeRole.', fields: [
+          { key: 'role_arn', label: 'Role ARN', required: true, type: 'string', placeholder: 'arn:aws:iam::123:role/X', description: '', default: '', options: [] },
+          { key: 'external_id', label: 'External ID', required: false, type: 'string', placeholder: '', description: 'optional', default: '', options: [] },
+        ],
+      },
+    ],
+  };
+
+  it('renders the auth-method dropdown when the provider declares 2+ methods', async () => {
+    const onLoad = jest.fn().mockResolvedValue({ ok: true });
+    render(
+      <Harness
+        providers={[bedrockMultiMeta]}
+        onLoad={onLoad}
+        initial={{ provider: 'bedrock-multi', authMethod: 'iam_role', config: { region: 'us-east-1' }, apiKey: '' }}
+      />
+    );
+    await waitFor(() =>
+      expect(screen.getAllByLabelText('Authentication method').length).toBeGreaterThan(0)
+    );
+  });
+
+  it('renders the per-method credential field when access_keys is selected', async () => {
+    const onLoad = jest.fn().mockResolvedValue({ ok: true });
+    render(
+      <Harness
+        providers={[bedrockMultiMeta]}
+        onLoad={onLoad}
+        initial={{ provider: 'bedrock-multi', authMethod: 'access_keys', config: { region: 'us-east-1' }, apiKey: '' }}
+      />
+    );
+    await waitFor(() => expect(screen.getByLabelText('Access Keys')).toBeInTheDocument());
+  });
+
+  it('renders the per-method non-credential field (role_arn) when assume_role is selected', async () => {
+    const onLoad = jest.fn().mockResolvedValue({ ok: true });
+    render(
+      <Harness
+        providers={[bedrockMultiMeta]}
+        onLoad={onLoad}
+        initial={{ provider: 'bedrock-multi', authMethod: 'assume_role', config: { region: 'us-east-1' }, apiKey: '' }}
+      />
+    );
+    await waitFor(() => expect(screen.getAllByLabelText(/Role ARN/i).length).toBeGreaterThan(0));
+    expect(screen.getAllByLabelText(/External ID/i).length).toBeGreaterThan(0);
+  });
+
+  it('sends auth_method in the cfg map on Load models', async () => {
+    const onLoad = jest.fn().mockResolvedValue({ ok: true });
+    render(
+      <Harness
+        providers={[bedrockMultiMeta]}
+        onLoad={onLoad}
+        initial={{
+          provider: 'bedrock-multi',
+          authMethod: 'access_keys',
+          config: { region: 'us-east-1' },
+          apiKey: 'AKIATEST:secret',
+        }}
+      />
+    );
+    const btn = await screen.findByRole('button', { name: 'Load models' });
+    fireEvent.click(btn);
+    await waitFor(() => expect(onLoad).toHaveBeenCalledTimes(1));
+    const cfg = onLoad.mock.calls[0][0];
+    expect(cfg.auth_method).toBe('access_keys');
+    expect(cfg.credentials_json).toBe('AKIATEST:secret');
+    expect(cfg.region).toBe('us-east-1');
+  });
+
+  it('disables Load models when auth_method is unselected on a multi-method provider', async () => {
+    const onLoad = jest.fn().mockResolvedValue({ ok: true });
+    render(
+      <Harness
+        providers={[bedrockMultiMeta]}
+        onLoad={onLoad}
+        initial={{ provider: 'bedrock-multi', authMethod: '', config: { region: 'us-east-1' }, apiKey: '' }}
+      />
+    );
+    const btn = await screen.findByRole('button', { name: 'Load models' });
+    expect(btn).toBeDisabled();
   });
 });

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	gollm "github.com/decisionbox-io/decisionbox/libs/go-common/llm"
+	"github.com/decisionbox-io/decisionbox/libs/go-common/secrets"
 	"github.com/decisionbox-io/decisionbox/services/api/models"
 
 	// Register real providers so GetProviderMeta finds them.
@@ -17,6 +18,25 @@ import (
 	_ "github.com/decisionbox-io/decisionbox/providers/llm/ollama"
 	_ "github.com/decisionbox-io/decisionbox/providers/llm/openai"
 )
+
+// stubSecretProvider records which keys were requested so a test can
+// assert the slot-routing logic picks the right secret.
+type stubSecretProvider struct {
+	values   map[string]string // key → value (project-scoped tests use one project)
+	requests []string          // append-only list of keys passed to Get
+}
+
+func (s *stubSecretProvider) Get(_ context.Context, _, key string) (string, error) {
+	s.requests = append(s.requests, key)
+	if v, ok := s.values[key]; ok {
+		return v, nil
+	}
+	return "", secrets.ErrNotFound
+}
+func (s *stubSecretProvider) Set(context.Context, string, string, string) error { return nil }
+func (s *stubSecretProvider) List(context.Context, string) ([]secrets.SecretEntry, error) {
+	return nil, nil
+}
 
 // --- ListLiveLLMModels (cloud-neutral; POST body with credentials) ---
 
@@ -219,6 +239,270 @@ func TestProvidersHandler_ListLiveLLMModelsForProject_NoSecretProviderReturnsCat
 	}
 	if len(resp.Data.Models) == 0 {
 		t.Error("catalog rows must still be returned")
+	}
+}
+
+// --- ListLiveLLMModelsForProject slot routing ---
+
+// callForProject is a small helper to invoke the handler with a slot body
+// and return the recorder so the assertions stay tight.
+func callForProject(t *testing.T, h *ProvidersHandler, pid, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/api/v1/projects/"+pid+"/providers/llm/models/live",
+		strings.NewReader(body))
+	req.SetPathValue("id", pid)
+	w := httptest.NewRecorder()
+	h.ListLiveLLMModelsForProject(w, req)
+	return w
+}
+
+func TestProvidersHandler_ListLiveLLMModelsForProject_DefaultSlotReadsLLMCredentials(t *testing.T) {
+	repo := &stubProjectRepo{project: &models.Project{
+		ID:  "p",
+		LLM: models.LLMConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
+	}}
+	secrets := &stubSecretProvider{values: map[string]string{
+		"llm-credentials":       "sk-llm",
+		"blurb-llm-credentials": "sk-blurb",
+	}}
+	h := NewProvidersHandlerWithProject(repo, secrets)
+
+	w := callForProject(t, h, "p", `{}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if len(secrets.requests) != 1 || secrets.requests[0] != "llm-credentials" {
+		t.Errorf("requests = %v, want exactly [llm-credentials]", secrets.requests)
+	}
+}
+
+func TestProvidersHandler_ListLiveLLMModelsForProject_BlurbSlotReadsBlurbCredentials(t *testing.T) {
+	repo := &stubProjectRepo{project: &models.Project{
+		ID:  "p",
+		LLM: models.LLMConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
+		BlurbLLM: &models.BlurbLLMConfig{
+			Provider: "openai",
+			Model:    "gpt-4.1-nano",
+		},
+	}}
+	secrets := &stubSecretProvider{values: map[string]string{
+		"llm-credentials":       "sk-llm",
+		"blurb-llm-credentials": "sk-blurb",
+	}}
+	h := NewProvidersHandlerWithProject(repo, secrets)
+
+	w := callForProject(t, h, "p", `{"slot":"blurb_llm"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if len(secrets.requests) != 1 || secrets.requests[0] != "blurb-llm-credentials" {
+		t.Errorf("requests = %v, want exactly [blurb-llm-credentials]", secrets.requests)
+	}
+}
+
+// When the project has no blurb override the handler borrows the
+// analysis LLM provider but still prefers the blurb-specific secret
+// — matching the agent's resolveBlurbLLM lookup order
+// (blurb-llm-credentials first, then llm-credentials). Without a
+// blurb-credentials secret stored, the handler must fall back to
+// llm-credentials, so the dashboard's Load-models reads exactly the
+// same credential the agent would read at indexing time.
+func TestProvidersHandler_ListLiveLLMModelsForProject_BlurbSlotFallsBackToLLM(t *testing.T) {
+	repo := &stubProjectRepo{project: &models.Project{
+		ID:  "p",
+		LLM: models.LLMConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
+		// BlurbLLM intentionally unset.
+	}}
+	secrets := &stubSecretProvider{values: map[string]string{
+		// blurb-llm-credentials NOT stored — handler must fall through.
+		"llm-credentials": "sk-llm",
+	}}
+	h := NewProvidersHandlerWithProject(repo, secrets)
+
+	w := callForProject(t, h, "p", `{"slot":"blurb_llm"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	want := []string{"blurb-llm-credentials", "llm-credentials"}
+	if len(secrets.requests) != len(want) {
+		t.Fatalf("requests = %v, want %v (blurb first, then fallback)", secrets.requests, want)
+	}
+	for i, k := range want {
+		if secrets.requests[i] != k {
+			t.Errorf("request[%d] = %q, want %q", i, secrets.requests[i], k)
+		}
+	}
+}
+
+// When a blurb-specific secret IS stored, the handler uses it directly
+// and never reads llm-credentials. Mirrors the agent's resolveBlurbLLM
+// — the blurb-specific credential always wins when present, even if
+// the blurb slot borrows the analysis LLM's provider/model.
+func TestProvidersHandler_ListLiveLLMModelsForProject_BlurbSlotPrefersBlurbSecretEvenOnFallback(t *testing.T) {
+	repo := &stubProjectRepo{project: &models.Project{
+		ID:  "p",
+		LLM: models.LLMConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
+		// No BlurbLLM override — falls through to LLM provider, but
+		// the blurb-credentials secret IS present and must win.
+	}}
+	secrets := &stubSecretProvider{values: map[string]string{
+		"blurb-llm-credentials": "sk-blurb",
+		"llm-credentials":       "sk-llm",
+	}}
+	h := NewProvidersHandlerWithProject(repo, secrets)
+
+	w := callForProject(t, h, "p", `{"slot":"blurb_llm"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	// Only one request — the blurb-specific secret short-circuits.
+	if len(secrets.requests) != 1 || secrets.requests[0] != "blurb-llm-credentials" {
+		t.Errorf("requests = %v, want exactly [blurb-llm-credentials]", secrets.requests)
+	}
+}
+
+func TestProvidersHandler_ListLiveLLMModelsForProject_InvalidSlot(t *testing.T) {
+	repo := &stubProjectRepo{project: &models.Project{ID: "p"}}
+	h := NewProvidersHandlerWithProject(repo, nil)
+
+	w := callForProject(t, h, "p", `{"slot":"warehouse"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "invalid slot") {
+		t.Errorf("body = %s, want invalid-slot error", w.Body.String())
+	}
+}
+
+// --- writeLiveModelsResponse merge: PreferLiveModelID ---
+
+// When a provider sets PreferLiveModelID (Ollama), the merge must keep
+// the live ID as the picker row's ID even when it matches a catalog
+// alias. Other providers (the default) project onto the catalog
+// canonical so identical IDs don't double-list. This guards against
+// the Ollama-specific 404 where saving the canonical (e.g. "qwen3")
+// fails because the upstream only knows the tagged form ("qwen3:32b").
+func TestWriteLiveModelsResponse_PreferLiveModelIDKeepsTaggedID(t *testing.T) {
+	meta := gollm.ProviderMeta{
+		Name: "test-provider",
+		Models: []gollm.ModelEntry{
+			{
+				ID:      "qwen3",
+				Aliases: []string{"qwen3:32b", "qwen3:14b"},
+				Wire:    gollm.WireUnknown,
+			},
+		},
+		PreferLiveModelID:  true,
+		DispatchAnyModelID: true,
+	}
+	live := []gollm.RemoteModel{
+		{ID: "qwen3:32b", DisplayName: "qwen3:32b"},
+	}
+
+	w := httptest.NewRecorder()
+	writeLiveModelsResponse(w, meta, live, nil)
+
+	var resp struct {
+		Data struct {
+			Models []map[string]any `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Expect a row with the tagged ID, plus the catalog row "qwen3"
+	// (which is catalog-only — the dashboard filters it out of the
+	// picker, but it still gets serialized).
+	var taggedRow, canonicalRow map[string]any
+	for _, r := range resp.Data.Models {
+		switch r["id"] {
+		case "qwen3:32b":
+			taggedRow = r
+		case "qwen3":
+			canonicalRow = r
+		}
+	}
+	if taggedRow == nil {
+		t.Fatalf("expected a row with id=qwen3:32b; got models=%+v", resp.Data.Models)
+	}
+	if taggedRow["source"] != "live" {
+		t.Errorf("tagged row source = %v, want live", taggedRow["source"])
+	}
+	if taggedRow["dispatchable"] != true {
+		t.Errorf("tagged row dispatchable = %v, want true (DispatchAnyModelID is set)", taggedRow["dispatchable"])
+	}
+	if canonicalRow == nil {
+		t.Errorf("expected canonical catalog row qwen3 to remain in response")
+	} else if canonicalRow["source"] != "catalog" {
+		t.Errorf("canonical row source = %v, want catalog", canonicalRow["source"])
+	}
+}
+
+// Regression guard for the OTHER providers (OpenAI, Bedrock, etc.):
+// when PreferLiveModelID is NOT set, a live ID that matches a catalog
+// alias must collapse onto the canonical row, preserving the existing
+// "one row per canonical ID" picker behaviour.
+func TestWriteLiveModelsResponse_DefaultProjectsAliasOntoCanonical(t *testing.T) {
+	meta := gollm.ProviderMeta{
+		Name: "test-provider",
+		Models: []gollm.ModelEntry{
+			{
+				ID:      "gpt-4o",
+				Aliases: []string{"gpt-4o-2024-08-06"},
+				Wire:    gollm.WireOpenAICompat,
+			},
+		},
+	}
+	live := []gollm.RemoteModel{
+		{ID: "gpt-4o-2024-08-06", DisplayName: "gpt-4o-2024-08-06"},
+	}
+
+	w := httptest.NewRecorder()
+	writeLiveModelsResponse(w, meta, live, nil)
+
+	var resp struct {
+		Data struct {
+			Models []map[string]any `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data.Models) != 1 {
+		t.Fatalf("expected one merged row, got %d: %+v", len(resp.Data.Models), resp.Data.Models)
+	}
+	r := resp.Data.Models[0]
+	if r["id"] != "gpt-4o" {
+		t.Errorf("merged row id = %v, want canonical gpt-4o", r["id"])
+	}
+	if r["source"] != "both" {
+		t.Errorf("merged row source = %v, want both", r["source"])
+	}
+}
+
+func TestProvidersHandler_ListLiveLLMModelsForProject_EmptyBodyDefaultsToLLMSlot(t *testing.T) {
+	repo := &stubProjectRepo{project: &models.Project{
+		ID:  "p",
+		LLM: models.LLMConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
+	}}
+	secrets := &stubSecretProvider{values: map[string]string{
+		"llm-credentials": "sk-llm",
+	}}
+	h := NewProvidersHandlerWithProject(repo, secrets)
+
+	// Empty body (Content-Length: 0) — should not error and should
+	// route to the default LLM slot.
+	req := httptest.NewRequest("POST", "/api/v1/projects/p/providers/llm/models/live", nil)
+	req.SetPathValue("id", "p")
+	w := httptest.NewRecorder()
+	h.ListLiveLLMModelsForProject(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if len(secrets.requests) != 1 || secrets.requests[0] != "llm-credentials" {
+		t.Errorf("requests = %v, want exactly [llm-credentials]", secrets.requests)
 	}
 }
 
