@@ -11,6 +11,7 @@ import (
 
 	goembedding "github.com/decisionbox-io/decisionbox/libs/go-common/embedding"
 	gollm "github.com/decisionbox-io/decisionbox/libs/go-common/llm"
+	gocatalog "github.com/decisionbox-io/decisionbox/libs/go-common/llm/catalog"
 	"github.com/decisionbox-io/decisionbox/libs/go-common/secrets"
 	gowarehouse "github.com/decisionbox-io/decisionbox/libs/go-common/warehouse"
 	"github.com/decisionbox-io/decisionbox/services/api/database"
@@ -40,6 +41,49 @@ func NewProvidersHandlerWithProject(projectRepo database.ProjectRepo, secretProv
 // GET /api/v1/providers/llm
 func (h *ProvidersHandler) ListLLMProviders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, gollm.RegisteredProvidersMeta())
+}
+
+// ListExtendedLLMModels returns project-scoped LLM model entries
+// contributed by any registered external model registry. Empty by
+// default (no extenders registered); plugins may register entries via
+// libs/go-common/llm/catalog.RegisterExtender. The response shape
+// matches the per-model entries inside ListLLMProviders so the
+// dashboard can merge the two lists without reshaping.
+//
+// GET /api/v1/projects/{id}/llm/extended-models
+func (h *ProvidersHandler) ListExtendedLLMModels(w http.ResponseWriter, r *http.Request) {
+	pid := r.PathValue("id")
+	if pid == "" {
+		writeError(w, http.StatusBadRequest, "project id is required")
+		return
+	}
+	entries, err := gocatalog.Extend(r.Context(), pid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load extended models: "+err.Error())
+		return
+	}
+	// Flatten to the same ModelInfo shape the built-in catalog exposes,
+	// so the dashboard's model picker can render both lists with a
+	// single component.
+	out := make([]gollm.ModelInfo, 0, len(entries))
+	for _, e := range entries {
+		display := e.DisplayName
+		if display == "" {
+			display = e.ID
+		}
+		out = append(out, gollm.ModelInfo{
+			ID:                    e.ID,
+			DisplayName:           display,
+			Wire:                  string(e.Wire),
+			MaxOutputTokens:       e.MaxOutputTokens,
+			MaxInputTokens:        e.MaxInputTokens,
+			InputPricePerMillion:  e.Pricing.InputPerMillion,
+			OutputPricePerMillion: e.Pricing.OutputPerMillion,
+			Lifecycle:             e.Lifecycle,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ListWarehouseProviders returns registered warehouse providers with config metadata.
@@ -121,25 +165,33 @@ func (h *ProvidersHandler) ListLiveLLMModels(w http.ResponseWriter, r *http.Requ
 	writeLiveModelsResponse(w, meta, live, liveErr)
 }
 
-// fetchLiveModels calls the provider's ModelLister if the factory
-// succeeds and the provider implements the interface. Returns nil + nil
-// when the provider does not support live listing (no error, no rows).
+// fetchLiveModels asks the provider to list models and falls back to
+// an empty list when listing isn't supported. Same contract as the
+// embedding-side helper:
 //
-// A placeholder is injected into cfg["model"] if missing — bedrock /
-// vertex-ai / azure-foundry / ollama factories reject an empty model
-// field, but ListModels never reads it. Keeping the construction strict
-// for the Chat path while letting listing work without a picked model
-// is worth the small kludge.
+//   - cfg["model"] is stripped before construction. The model field is
+//     irrelevant to ListModels for every supported provider (Bedrock
+//     ListFoundationModels, OpenAI /v1/models, Vertex
+//     publishers/google/models, Azure Foundry deployments, Ollama
+//     /api/tags). Stripping prevents factories that probe the model
+//     upstream from breaking listing.
+//
+//   - If the factory rejects an empty model (Chat-path validators) the
+//     helper returns (nil, nil) — the dashboard then renders free-text
+//     + catalog, no user-visible error.
+//
+//   - If the constructed provider doesn't implement ModelLister, also
+//     (nil, nil).
 func fetchLiveModels(ctx context.Context, provider string, cfg map[string]string) ([]gollm.RemoteModel, error) {
-	if cfg == nil {
-		cfg = map[string]string{}
+	cfgNoModel := make(map[string]string, len(cfg))
+	for k, v := range cfg {
+		if k != "model" {
+			cfgNoModel[k] = v
+		}
 	}
-	if cfg["model"] == "" {
-		cfg["model"] = "list-only-placeholder"
-	}
-	prov, err := gollm.NewProvider(provider, gollm.ProviderConfig(cfg))
+	prov, err := gollm.NewProvider(provider, gollm.ProviderConfig(cfgNoModel))
 	if err != nil {
-		return nil, err
+		return nil, nil
 	}
 	lister, ok := prov.(gollm.ModelLister)
 	if !ok {
@@ -508,28 +560,38 @@ func (h *ProvidersHandler) ListLiveEmbeddingModelsForProject(w http.ResponseWrit
 	writeEmbeddingLiveModelsResponse(w, meta, live, liveErr)
 }
 
-// fetchLiveEmbeddingModels constructs the provider and asks it to list
-// models if it implements the optional ModelLister capability. Returns
-// (nil, nil) for providers that don't — the dashboard then just
-// renders the shipped catalog, no user-visible error.
+// fetchLiveEmbeddingModels asks the provider to list models and falls
+// back to an empty list when listing isn't supported. The semantics:
+//
+//   - "If the provider implements ModelLister, use it" — strip
+//     cfg["model"] before construction so listing never depends on a
+//     user-selected (or form-defaulted) model that may not exist on the
+//     upstream server. The model field is semantically irrelevant to
+//     the list operation; every supported provider's list API is
+//     model-agnostic (Bedrock ListFoundationModels, OpenAI /v1/models,
+//     Voyage /v1/models, Vertex publishers/google/models, Azure OpenAI
+//     deployments, Ollama /api/tags).
+//
+//   - "Otherwise return empty" — when the factory rejects an empty
+//     model (the runtime Embed() path validators), or when the
+//     constructed provider doesn't implement ModelLister, return
+//     (nil, nil). The dashboard renders free-text + catalog so the
+//     user can type a model name; no upstream-error noise is surfaced.
+//
+// This matches the user-facing contract: pick a provider, see what
+// the server has if it can tell us, otherwise type whatever you want.
 func fetchLiveEmbeddingModels(ctx context.Context, providerID string, cfg map[string]string) ([]goembedding.RemoteModel, error) {
-	if cfg == nil {
-		cfg = map[string]string{}
-	}
-	// Every registered embedding provider factory validates required
-	// config fields up-front, and most reject anything not on a strict
-	// model allowlist (Bedrock's modelDimensions, Voyage's, etc.). For
-	// a list-only call we just need the factory to succeed so
-	// ListModels can run — supply the first catalogued model id as a
-	// placeholder. ListModels never reads cfg["model"].
-	if cfg["model"] == "" {
-		if meta, ok := goembedding.GetProviderMeta(providerID); ok && len(meta.Models) > 0 {
-			cfg["model"] = meta.Models[0].ID
+	cfgNoModel := make(map[string]string, len(cfg))
+	for k, v := range cfg {
+		if k != "model" {
+			cfgNoModel[k] = v
 		}
 	}
-	prov, err := goembedding.NewProvider(providerID, goembedding.ProviderConfig(cfg))
+	prov, err := goembedding.NewProvider(providerID, goembedding.ProviderConfig(cfgNoModel))
 	if err != nil {
-		return nil, err
+		// Factory rejected the empty model — provider can't list
+		// without it. Fall back to "let the user type free text".
+		return nil, nil
 	}
 	lister, ok := prov.(goembedding.ModelLister)
 	if !ok {

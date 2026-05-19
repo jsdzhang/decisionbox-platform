@@ -245,15 +245,149 @@ func TestSQLFixer_FixSQL_Success(t *testing.T) {
 		Filter:       "",
 	})
 
-	fixed, err := fixer.FixSQL(context.Background(), "SELECT BAD FROM sessions", "column BAD not found", 0, queryexec.FixOpts{})
+	fix, err := fixer.FixSQL(context.Background(), "SELECT BAD FROM sessions", "column BAD not found", 0, queryexec.FixOpts{})
 	if err != nil {
 		t.Fatalf("FixSQL error: %v", err)
 	}
-	if fixed == "" {
+	if fix.FixedSQL == "" {
 		t.Error("fixed query should not be empty")
 	}
-	if fixed != "SELECT COUNT(*) FROM `test_dataset.sessions` WHERE app_id = 'test'" {
-		t.Errorf("fixed = %q", fixed)
+	if fix.FixedSQL != "SELECT COUNT(*) FROM `test_dataset.sessions` WHERE app_id = 'test'" {
+		t.Errorf("fixed = %q", fix.FixedSQL)
+	}
+	if fix.Prompt == "" {
+		t.Error("Prompt should be populated for fix-history recording")
+	}
+	if !strings.Contains(fix.Prompt, "[system]") || !strings.Contains(fix.Prompt, "[user]") {
+		t.Errorf("Prompt should carry the rendered system+user dialog, got: %q", fix.Prompt)
+	}
+	if fix.Response != "```sql\nSELECT COUNT(*) FROM `test_dataset.sessions` WHERE app_id = 'test'\n```" {
+		t.Errorf("Response should be the raw LLM body, got: %q", fix.Response)
+	}
+	if fix.InputTokens != 100 || fix.OutputTokens != 50 {
+		t.Errorf("token usage not propagated: in=%d out=%d", fix.InputTokens, fix.OutputTokens)
+	}
+}
+
+func TestSQLFixer_FixSQL_RecordsLLMErrorContext(t *testing.T) {
+	provider := testutil.NewMockLLMProvider()
+	provider.Error = fmt.Errorf("LLM unavailable")
+	client, _ := New(provider, "mock-model")
+	fixer := NewSQLFixer(SQLFixerOptions{
+		Client:       client,
+		SQLFixPrompt: "Fix {{ORIGINAL_SQL}}",
+		Dataset:      "ds",
+	})
+
+	res, err := fixer.FixSQL(context.Background(), "SELECT 1", "boom", 0, queryexec.FixOpts{})
+	if err == nil {
+		t.Fatal("expected error from LLM")
+	}
+	if res.Prompt == "" {
+		t.Error("prompt should be populated even when the LLM call errors so the recorded FixAttempt is not blank")
+	}
+	if res.FixedSQL != "" {
+		t.Error("FixedSQL must remain empty when the LLM call errors")
+	}
+}
+
+func TestSQLFixer_FixSQL_UsesCatalogMaxOutputTokens(t *testing.T) {
+	// Provider with a catalog entry that declares a non-default
+	// MaxOutputTokens — when the fixer sends its request it must pick
+	// up the per-model cap, not the historical hard-coded value. The
+	// provider name is unique so we don't collide with built-in
+	// registrations.
+	const providerName = "test-fixer-max-tokens"
+	const modelID = "test-model-x"
+
+	gollm.RegisterWithMeta(providerName, func(_ gollm.ProviderConfig) (gollm.Provider, error) {
+		return nil, fmt.Errorf("not used")
+	}, gollm.ProviderMeta{
+		ID:   providerName,
+		Name: "fixer max tokens test",
+		Models: []gollm.ModelEntry{
+			{ID: modelID, Wire: gollm.WireAnthropic, MaxOutputTokens: 13579},
+		},
+	})
+
+	provider := testutil.NewMockLLMProvider()
+	provider.DefaultResponse = &gollm.ChatResponse{
+		Content: "```sql\nSELECT 1\n```",
+		Usage:   gollm.Usage{InputTokens: 5, OutputTokens: 3},
+	}
+	client, _ := New(provider, modelID)
+	client.SetProvenance("p1", "r1", providerName)
+
+	fixer := NewSQLFixer(SQLFixerOptions{
+		Client:       client,
+		SQLFixPrompt: "Fix {{ORIGINAL_SQL}}",
+		Dataset:      "ds",
+	})
+
+	if _, err := fixer.FixSQL(context.Background(), "SELECT BAD", "broken", 0, queryexec.FixOpts{}); err != nil {
+		t.Fatalf("FixSQL: %v", err)
+	}
+
+	if len(provider.Calls) != 1 {
+		t.Fatalf("provider.Calls = %d, want 1", len(provider.Calls))
+	}
+	gotMax := provider.Calls[0].Request.MaxTokens
+	if gotMax != 13579 {
+		t.Errorf("MaxTokens passed to the LLM = %d, want 13579 (the catalog cap for %s/%s)", gotMax, providerName, modelID)
+	}
+}
+
+func TestSQLFixer_FixSQL_FallsBackToDefaultWhenProviderUnregistered(t *testing.T) {
+	// Unknown provider name — GetMaxOutputTokens must fall back to the
+	// 8192 global default, so the fixer never sends a 0 max_tokens
+	// (some providers reject 0 outright; Ollama interprets it as
+	// "unlimited" which can hang).
+	provider := testutil.NewMockLLMProvider()
+	provider.DefaultResponse = &gollm.ChatResponse{
+		Content: "```sql\nSELECT 1\n```",
+		Usage:   gollm.Usage{InputTokens: 5, OutputTokens: 3},
+	}
+	client, _ := New(provider, "totally-unknown-model")
+	client.SetProvenance("p1", "r1", "totally-unknown-provider")
+
+	fixer := NewSQLFixer(SQLFixerOptions{
+		Client:       client,
+		SQLFixPrompt: "Fix {{ORIGINAL_SQL}}",
+		Dataset:      "ds",
+	})
+
+	if _, err := fixer.FixSQL(context.Background(), "SELECT BAD", "broken", 0, queryexec.FixOpts{}); err != nil {
+		t.Fatalf("FixSQL: %v", err)
+	}
+
+	gotMax := provider.Calls[0].Request.MaxTokens
+	if gotMax != 8192 {
+		t.Errorf("MaxTokens for unknown provider = %d, want 8192 (global default)", gotMax)
+	}
+}
+
+func TestSQLFixer_FixSQL_RecordsExtractErrorContext(t *testing.T) {
+	provider := testutil.NewMockLLMProvider()
+	provider.DefaultResponse = &gollm.ChatResponse{
+		Content: "I cannot fix this query.",
+		Usage:   gollm.Usage{InputTokens: 3, OutputTokens: 2},
+	}
+	client, _ := New(provider, "mock-model")
+	fixer := NewSQLFixer(SQLFixerOptions{
+		Client:       client,
+		SQLFixPrompt: "Fix {{ORIGINAL_SQL}}",
+		Dataset:      "ds",
+	})
+
+	res, err := fixer.FixSQL(context.Background(), "SELECT 1", "boom", 0, queryexec.FixOpts{})
+	if err == nil {
+		t.Fatal("expected extraction error")
+	}
+	if res.Response != "I cannot fix this query." {
+		t.Errorf("Response should still be populated on extraction failure, got %q", res.Response)
+	}
+	if res.InputTokens != 3 || res.OutputTokens != 2 {
+		t.Errorf("token usage should propagate even when extraction fails: in=%d out=%d", res.InputTokens, res.OutputTokens)
 	}
 }
 
@@ -469,11 +603,11 @@ func TestSQLFixer_FixSQL_TemplateSubstitution(t *testing.T) {
 	})
 	fixer.SetSchemaContext("schema_info_here")
 
-	fixed, err := fixer.FixSQL(context.Background(), "BAD SQL", "syntax error", 0, queryexec.FixOpts{})
+	fix, err := fixer.FixSQL(context.Background(), "BAD SQL", "syntax error", 0, queryexec.FixOpts{})
 	if err != nil {
 		t.Fatalf("FixSQL error: %v", err)
 	}
-	if fixed == "" {
+	if fix.FixedSQL == "" {
 		t.Error("should return fixed SQL")
 	}
 
