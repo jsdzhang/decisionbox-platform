@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-19
+
 ### Fixed
 
 - **AWS Bedrock `ListFoundationModels` now uses the project's auth method** — `providers/llm/bedrock/list_models.go` and `providers/embedding/bedrock/list_models.go` were calling `awsconfig.LoadDefaultConfig` to build their own control-plane client, bypassing the per-project `auth_method` (access_keys / assume_role / iam_role) the factory had already resolved via `libs/awscreds`. On any host whose shell has AWS credentials available (env vars, `~/.aws/credentials`, EC2 IMDS, EKS pod role) the bug was invisible — the SDK's ambient chain quietly filled in. On Docker setups whose container has no AWS env vars the call fell through to IMDS, which then 404'd with `no EC2 IMDS role found`, and the dashboard's "Load models" button silently fell back to the catalog instead of the live list. Both providers now stash the factory-resolved `aws.Config` on the provider struct and reuse it in `ListModels`. Audited every other provider's `list_models.go` and confirmed Bedrock was the only gap — OpenAI / Claude / Azure Foundry / Voyage / Azure OpenAI Embedding reuse `p.apiKey`, Vertex (LLM + embedding) reuse `p.auth.token(ctx)`, Ollama reuses its factory-built client. Regression tests added at `providers/llm/bedrock/provider_test.go::TestFactory_StashesAwsCfg_AccessKeys` and `providers/embedding/bedrock/factory_test.go::TestFactory_StashesAwsCfg_AccessKeys` retrieve credentials from the stashed `aws.Config` and assert the static access key the factory was handed actually round-trips. Pre-existing integration test rewritten to build the AWS config the same way the factory does instead of relying on the now-removed `LoadDefaultConfig` call inside `ListModels`.
@@ -295,7 +297,8 @@ Initial public release.
 - 85%+ unit test coverage across all modules
 - Comprehensive documentation (28 files across 6 sections)
 
-[Unreleased]: https://github.com/decisionbox-io/decisionbox-platform/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/decisionbox-io/decisionbox-platform/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/decisionbox-io/decisionbox-platform/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/decisionbox-io/decisionbox-platform/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/decisionbox-io/decisionbox-platform/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/decisionbox-io/decisionbox-platform/compare/v0.2.0...v0.3.0
